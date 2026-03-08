@@ -1,0 +1,4 @@
+[target.x86_64-unknown-linux-gnu.env]
+ROCKSDB_LIB_DIR = "/usr/lib/x86_64-linux-gnu"
+ROCKSDB_INCLUDE_DIR = "/usr/include"
+LIBROCKSDB_SYS_STATIC = "0"

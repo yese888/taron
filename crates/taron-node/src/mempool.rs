@@ -1,0 +1,136 @@
+//! Mempool — verified transaction storage with deduplication.
+
+use std::collections::HashMap;
+use taron_core::{Transaction, PoscVerifier};
+
+/// In-memory pool of verified transactions, keyed by tx hash.
+#[derive(Debug, Default)]
+pub struct Mempool {
+    txs: HashMap<String, Transaction>,
+}
+
+impl Mempool {
+    pub fn new() -> Self {
+        Self { txs: HashMap::new() }
+    }
+
+    /// Number of transactions in the mempool.
+    pub fn len(&self) -> usize {
+        self.txs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.txs.is_empty()
+    }
+
+    /// Check if a transaction hash is already known.
+    pub fn contains(&self, tx_hash: &str) -> bool {
+        self.txs.contains_key(tx_hash)
+    }
+
+    /// Get all transaction hashes.
+    pub fn tx_hashes(&self) -> Vec<String> {
+        self.txs.keys().cloned().collect()
+    }
+
+    /// Get transactions by hashes (for state sync).
+    pub fn get_txs(&self, hashes: &[String]) -> Vec<Transaction> {
+        hashes.iter()
+            .filter_map(|h| self.txs.get(h).cloned())
+            .collect()
+    }
+
+    /// Insert a transaction after full validation (signature + PoSC).
+    /// Returns Ok(true) if inserted, Ok(false) if duplicate, Err on invalid.
+    pub fn insert(&mut self, tx: Transaction) -> Result<bool, String> {
+        let hash = tx.hash_hex();
+
+        // Dedup
+        if self.txs.contains_key(&hash) {
+            return Ok(false);
+        }
+
+        // Verify signature
+        tx.verify_signature().map_err(|e| format!("signature: {}", e))?;
+
+        // Verify PoSC proof
+        PoscVerifier::verify(&tx).map_err(|e| format!("posc: {}", e))?;
+
+        self.txs.insert(hash, tx);
+        Ok(true)
+    }
+
+    /// Get all transactions (for iteration).
+    pub fn all_txs(&self) -> Vec<&Transaction> {
+        self.txs.values().collect()
+    }
+
+    /// Remove a transaction by hash (called after block inclusion).
+    pub fn remove(&mut self, tx_hash: &str) {
+        self.txs.remove(tx_hash);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use taron_core::{Wallet, TxBuilder};
+
+    fn make_valid_tx() -> Transaction {
+        let sender = Wallet::generate();
+        let recipient = Wallet::generate();
+        TxBuilder::new(&sender)
+            .recipient(recipient.public_key())
+            .amount(1_000_000)
+            .sequence(1)
+            .build_and_prove()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_mempool_insert_valid() {
+        let mut pool = Mempool::new();
+        let tx = make_valid_tx();
+        assert!(pool.insert(tx).unwrap());
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn test_mempool_dedup() {
+        let mut pool = Mempool::new();
+        let tx = make_valid_tx();
+        let tx2 = tx.clone();
+        assert!(pool.insert(tx).unwrap());
+        assert!(!pool.insert(tx2).unwrap()); // duplicate
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn test_mempool_reject_tampered() {
+        let mut pool = Mempool::new();
+        let mut tx = make_valid_tx();
+        tx.amount += 1; // tamper
+        assert!(pool.insert(tx).is_err());
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn test_mempool_tx_hashes() {
+        let mut pool = Mempool::new();
+        let tx = make_valid_tx();
+        let hash = tx.hash_hex();
+        pool.insert(tx).unwrap();
+        assert!(pool.tx_hashes().contains(&hash));
+    }
+
+    #[test]
+    fn test_mempool_get_txs() {
+        let mut pool = Mempool::new();
+        let tx = make_valid_tx();
+        let hash = tx.hash_hex();
+        pool.insert(tx).unwrap();
+        let fetched = pool.get_txs(&[hash.clone(), "nonexistent".into()]);
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].hash_hex(), hash);
+    }
+}

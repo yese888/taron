@@ -1,0 +1,479 @@
+//! Blockchain — ordered chain of blocks with RocksDB persistence.
+//!
+//! Each block is stored in RocksDB keyed by its 8-byte little-endian index.
+//! Only `height` and `difficulty` are kept in RAM — blocks are read from disk
+//! on demand. This allows the chain to grow to millions of blocks without
+//! exhausting memory.
+//!
+//! ## Persistence
+//! `Blockchain::load_or_create(path, difficulty)` opens (or creates) a RocksDB
+//! database at `path` (a directory). If a legacy `chain.json` exists next to it,
+//! it is automatically migrated to RocksDB on first run.
+//!
+//! ## Save
+//! Every `apply_block()` write is atomic and immediate — no explicit `save()`
+//! call is needed. `save()` exists only for API compatibility and is a no-op.
+
+use std::path::Path;
+use rocksdb::{DB, Options};
+use crate::{Block, Ledger, TaronError};
+
+/// DAA: adjust difficulty every N blocks.
+const DAA_WINDOW: u64 = 10;
+/// DAA: target time per block in milliseconds (30 seconds).
+const TARGET_BLOCK_MS: u64 = 30_000;
+
+// ── RocksDB key layout ────────────────────────────────────────────────────────
+// b"b:" + index_le_u64  →  bincode-encoded Block
+// b"meta:h"             →  height as le u64
+// b"meta:d"             →  difficulty as le u32
+
+fn block_key(index: u64) -> [u8; 10] {
+    let mut key = [0u8; 10];
+    key[0] = b'b';
+    key[1] = b':';
+    key[2..].copy_from_slice(&index.to_le_bytes());
+    key
+}
+const KEY_HEIGHT: &[u8] = b"meta:h";
+const KEY_DIFF:   &[u8] = b"meta:d";
+
+// ── Blockchain ────────────────────────────────────────────────────────────────
+
+/// The TARON blockchain backed by RocksDB.
+pub struct Blockchain {
+    db: DB,
+    /// Cached tip height (index of the last block). Source of truth is in DB.
+    pub height: u64,
+    /// Proof-of-work difficulty (leading-zero bits required).
+    pub difficulty: u32,
+}
+
+impl std::fmt::Debug for Blockchain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Blockchain")
+            .field("height", &self.height)
+            .field("difficulty", &self.difficulty)
+            .finish()
+    }
+}
+
+impl Blockchain {
+    // ── Public query API ─────────────────────────────────────────────────────
+
+    /// Current tip index (0 = only genesis).
+    pub fn height(&self) -> u64 {
+        self.height
+    }
+
+    /// Fetch a single block by index. Returns `None` if out of range.
+    pub fn block_at(&self, index: u64) -> Option<Block> {
+        let bytes = self.db.get(block_key(index)).ok()??;
+        bincode::deserialize(&bytes).ok()
+    }
+
+    /// Tip block (the most recently applied block).
+    pub fn tip(&self) -> Block {
+        self.block_at(self.height)
+            .expect("tip block must exist in DB")
+    }
+
+    /// Total number of blocks (genesis + mined blocks).
+    pub fn total_blocks(&self) -> usize {
+        (self.height + 1) as usize
+    }
+
+    /// Return up to `limit` blocks starting from `offset` from the tip,
+    /// newest first. Used by the RPC `/blocks` endpoint.
+    pub fn blocks_paginated(&self, offset: usize, limit: usize) -> Vec<Block> {
+        if self.height == 0 && offset > 0 {
+            return vec![];
+        }
+        let start = self.height.saturating_sub(offset as u64);
+        let end   = start.saturating_sub((limit as u64).saturating_sub(1));
+        (end..=start).rev().filter_map(|i| self.block_at(i)).collect()
+    }
+
+    /// Return all blocks in [from, to] (inclusive), oldest first.
+    /// Used by the IBD `GetBlocks` handler.
+    pub fn blocks_range(&self, from: u64, to: u64) -> Vec<Block> {
+        let to = to.min(self.height);
+        (from..=to).filter_map(|i| self.block_at(i)).collect()
+    }
+
+    /// Return all blocks mined by `pubkey`, oldest first.
+    /// O(height) — acceptable for testnet, add a secondary index for mainnet.
+    pub fn blocks_by_miner(&self, pubkey: &[u8; 32]) -> Vec<Block> {
+        (0..=self.height)
+            .filter_map(|i| self.block_at(i))
+            .filter(|b| &b.miner == pubkey)
+            .collect()
+    }
+
+    // ── Mutation ─────────────────────────────────────────────────────────────
+
+    /// Validate and append a new block, then credit the miner in the ledger.
+    /// The block is written to RocksDB atomically before returning.
+    pub fn apply_block(&mut self, block: &Block, ledger: &mut Ledger) -> Result<(), TaronError> {
+        let prev = self.tip();
+        if !block.is_valid(&prev, self.difficulty) {
+            return Err(TaronError::InvalidBlock);
+        }
+
+        // CVE-001: enforce canonical reward — miner cannot self-assign arbitrary amounts
+        if block.reward != crate::TESTNET_REWARD {
+            return Err(TaronError::InvalidBlock);
+        }
+
+        // Validate all transactions before applying any (atomic).
+        // validate_structure() is intentionally NOT called here — its ±30s timestamp
+        // check would reject legitimate txs that sat in the mempool before confirmation.
+        // Timestamp is only enforced at mempool ingestion (submit_tx). Sequence numbers
+        // prevent replay attacks independently.
+        for tx in &block.transactions {
+            tx.verify_signature().map_err(|_| TaronError::InvalidBlock)?;
+        }
+
+        ledger.apply_coinbase(&block.miner, block.reward);
+
+        // Apply transactions
+        for tx in &block.transactions {
+            ledger.apply_tx(tx).map_err(|_| TaronError::InvalidBlock)?;
+        }
+
+        // Write block to DB
+        let encoded = bincode::serialize(block).expect("block serialization");
+        self.db.put(block_key(block.index), &encoded).expect("rocksdb put block");
+        self.height = block.index;
+        self.db.put(KEY_HEIGHT, &self.height.to_le_bytes()).expect("rocksdb put height");
+
+        // DAA: recalculate difficulty at every window boundary
+        if self.height > 0 && self.height % DAA_WINDOW == 0 {
+            self.difficulty = self.compute_next_difficulty();
+            self.db.put(KEY_DIFF, &self.difficulty.to_le_bytes()).expect("rocksdb put diff");
+        }
+
+        Ok(())
+    }
+
+    /// Like `apply_block` but skips the timestamp drift check and sequence check.
+    /// Used during IBD (Initial Block Download) for historical blocks.
+    pub fn apply_block_ibd(&mut self, block: &Block, ledger: &mut Ledger) -> Result<(), TaronError> {
+        let prev = self.tip();
+        if !block.is_valid_ibd(&prev, self.difficulty) {
+            return Err(TaronError::InvalidBlock);
+        }
+
+        if block.reward != crate::TESTNET_REWARD {
+            return Err(TaronError::InvalidBlock);
+        }
+
+        // During IBD: skip validate_structure() — its ±30s timestamp check
+        // would reject legitimate historical payout transactions.
+        // Signature verification is still performed for security.
+        for tx in &block.transactions {
+            if tx.verify_signature().is_err() {
+                return Err(TaronError::InvalidBlock);
+            }
+        }
+
+        ledger.apply_coinbase(&block.miner, block.reward);
+
+        // Use apply_tx_ibd: skips sequence check (local ledger may have diverged
+        // from server's due to payout txs embedded in earlier blocks), but still
+        // sets sequence = tx.sequence so subsequent txs chain correctly.
+        for tx in &block.transactions {
+            if ledger.apply_tx_ibd(tx).is_err() {
+                return Err(TaronError::InvalidBlock);
+            }
+        }
+
+        let encoded = bincode::serialize(block).expect("block serialization");
+        self.db.put(block_key(block.index), &encoded).expect("rocksdb put block");
+        self.height = block.index;
+        self.db.put(KEY_HEIGHT, &self.height.to_le_bytes()).expect("rocksdb put height");
+
+        if self.height > 0 && self.height % DAA_WINDOW == 0 {
+            self.difficulty = self.compute_next_difficulty();
+            self.db.put(KEY_DIFF, &self.difficulty.to_le_bytes()).expect("rocksdb put diff");
+        }
+
+        Ok(())
+    }
+
+    /// No-op: RocksDB writes are immediate. Kept for API compatibility.
+    pub fn save(&self, _path: &Path) {}
+
+    // ── Construction / persistence ───────────────────────────────────────────
+
+    /// Open (or create) the RocksDB database at `path`.
+    ///
+    /// - If the DB already has data, load height + difficulty from metadata.
+    /// - If a `chain.json` file exists next to `path` (legacy format), migrate
+    ///   it to RocksDB automatically.
+    /// - Otherwise, start fresh with the genesis block.
+    pub fn load_or_create(path: &Path, difficulty: u32) -> Self {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+
+        let db = DB::open(&opts, path).expect("Failed to open RocksDB");
+
+        // ── Case 1: existing DB ──────────────────────────────────────────────
+        if let Ok(Some(h_bytes)) = db.get(KEY_HEIGHT) {
+            let h_arr: [u8; 8] = (&h_bytes[..]).try_into().unwrap_or([0u8; 8]);
+            let height = u64::from_le_bytes(h_arr);
+            let diff = if let Ok(Some(d_bytes)) = db.get(KEY_DIFF) {
+                let d_arr: [u8; 4] = (&d_bytes[..]).try_into().unwrap_or([0u8; 4]);
+                u32::from_le_bytes(d_arr)
+            } else { difficulty };
+            eprintln!("[CHAIN] Loaded from RocksDB — height: {}, diff: {} bits", height, diff);
+            return Self { db, height, difficulty: diff };
+        }
+
+        // ── Case 2: migrate from legacy chain.json ───────────────────────────
+        // Derive json path: "~/.taron-testnet/chain.db" → "~/.taron-testnet/chain.json"
+        let json_path = path.with_extension("json");
+        if json_path.exists() {
+            if let Ok(data) = std::fs::read_to_string(&json_path) {
+                #[derive(serde::Deserialize)]
+                struct LegacyChain { blocks: Vec<Block>, difficulty: u32 }
+
+                if let Ok(legacy) = serde_json::from_str::<LegacyChain>(&data) {
+                    eprintln!(
+                        "[CHAIN] Migrating chain.json ({} blocks) → RocksDB…",
+                        legacy.blocks.len()
+                    );
+                    let height = legacy.blocks.last().map(|b| b.index).unwrap_or(0);
+                    for block in &legacy.blocks {
+                        let enc = bincode::serialize(block).expect("encode");
+                        db.put(block_key(block.index), &enc).expect("rocksdb put");
+                    }
+                    db.put(KEY_HEIGHT, &height.to_le_bytes()).expect("rocksdb put height");
+                    db.put(KEY_DIFF, &legacy.difficulty.to_le_bytes()).expect("rocksdb put diff");
+                    eprintln!("[CHAIN] Migration complete — height: {}", height);
+                    return Self { db, height, difficulty: legacy.difficulty };
+                }
+            }
+        }
+
+        // ── Case 3: fresh genesis ────────────────────────────────────────────
+        let genesis = Block::genesis();
+        let enc = bincode::serialize(&genesis).expect("encode genesis");
+        db.put(block_key(0), &enc).expect("rocksdb put genesis");
+        db.put(KEY_HEIGHT, &0u64.to_le_bytes()).expect("rocksdb put height");
+        db.put(KEY_DIFF, &difficulty.to_le_bytes()).expect("rocksdb put diff");
+        eprintln!("[CHAIN] Fresh chain — genesis written to RocksDB");
+        Self { db, height: 0, difficulty }
+    }
+
+    // ── Private helpers ──────────────────────────────────────────────────────
+
+    fn compute_next_difficulty(&self) -> u32 {
+        let window_end   = self.block_at(self.height).unwrap();
+        let window_start = self.block_at(self.height - DAA_WINDOW).unwrap();
+
+        let actual_ms = window_end.timestamp.saturating_sub(window_start.timestamp);
+        let target_ms = TARGET_BLOCK_MS * DAA_WINDOW;
+
+        if actual_ms == 0 {
+            return (self.difficulty + 1).min(30);
+        }
+
+        let new_diff = if actual_ms < target_ms / 4 {
+            self.difficulty.saturating_add(2)
+        } else if actual_ms < target_ms {
+            self.difficulty.saturating_add(1)
+        } else if actual_ms > target_ms * 4 {
+            self.difficulty.saturating_sub(2)
+        } else if actual_ms > target_ms {
+            self.difficulty.saturating_sub(1)
+        } else {
+            self.difficulty
+        };
+
+        new_diff.max(1).min(30)
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{TESTNET_DIFFICULTY, TESTNET_REWARD};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_chain(difficulty: u32) -> (Blockchain, std::path::PathBuf) {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::path::PathBuf::from(format!("/tmp/taron_test_chain_{}", n));
+        let chain = Blockchain::load_or_create(&path, difficulty);
+        (chain, path)
+    }
+
+    fn make_valid_block(chain: &Blockchain, miner: [u8; 32], reward: u64) -> Block {
+        let tip = chain.tip();
+        let mut candidate = Block {
+            index: tip.index + 1,
+            prev_hash: tip.hash,
+            timestamp: tip.timestamp + 1_000,
+            miner,
+            nonce: 0,
+            hash: [0u8; 32],
+            reward,
+            transactions: vec![],
+        };
+        candidate.hash = candidate.hash_header();
+        candidate
+    }
+
+    #[test]
+    fn test_new_blockchain_has_genesis() {
+        let (chain, path) = test_chain(0);
+        assert_eq!(chain.height(), 0);
+        assert_eq!(chain.tip().index, 0);
+        assert_eq!(chain.total_blocks(), 1);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn test_apply_valid_block() {
+        let (mut chain, path) = test_chain(0);
+        let mut ledger = Ledger::new();
+        let miner = [1u8; 32];
+
+        let block = make_valid_block(&chain, miner, TESTNET_REWARD);
+        chain.apply_block(&block, &mut ledger).unwrap();
+
+        assert_eq!(chain.height(), 1);
+        assert_eq!(ledger.balance(&miner), TESTNET_REWARD);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn test_apply_invalid_block_rejected() {
+        let (mut chain, path) = test_chain(0);
+        let mut ledger = Ledger::new();
+        let miner = [1u8; 32];
+
+        let mut block = make_valid_block(&chain, miner, TESTNET_REWARD);
+        block.prev_hash = [99u8; 32];
+        block.hash = block.hash_header();
+
+        let result = chain.apply_block(&block, &mut ledger);
+        assert!(matches!(result, Err(TaronError::InvalidBlock)));
+        assert_eq!(chain.height(), 0);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn test_multiple_blocks() {
+        let (mut chain, path) = test_chain(0);
+        let mut ledger = Ledger::new();
+        let miner = [7u8; 32];
+
+        for _ in 0..5 {
+            let block = make_valid_block(&chain, miner, TESTNET_REWARD);
+            chain.apply_block(&block, &mut ledger).unwrap();
+        }
+
+        assert_eq!(chain.height(), 5);
+        assert_eq!(ledger.balance(&miner), TESTNET_REWARD * 5);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        let (mut chain, path) = test_chain(0);
+        let mut ledger = Ledger::new();
+        let miner = [3u8; 32];
+
+        let block = make_valid_block(&chain, miner, TESTNET_REWARD);
+        chain.apply_block(&block, &mut ledger).unwrap();
+        drop(chain); // close DB
+
+        // Re-open — data must persist
+        let loaded = Blockchain::load_or_create(&path, 0);
+        assert_eq!(loaded.height(), 1);
+        assert_eq!(loaded.tip().miner, miner);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn test_blocks_range() {
+        let (mut chain, path) = test_chain(0);
+        let mut ledger = Ledger::new();
+        let miner = [5u8; 32];
+
+        for _ in 0..5 {
+            let b = make_valid_block(&chain, miner, TESTNET_REWARD);
+            chain.apply_block(&b, &mut ledger).unwrap();
+        }
+
+        let range = chain.blocks_range(2, 4);
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[0].index, 2);
+        assert_eq!(range[2].index, 4);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn test_blocks_by_miner() {
+        let (mut chain, path) = test_chain(0);
+        let mut ledger = Ledger::new();
+        let miner_a = [1u8; 32];
+        let miner_b = [2u8; 32];
+
+        // 3 blocks from A, 2 from B
+        for _ in 0..3 {
+            let b = make_valid_block(&chain, miner_a, TESTNET_REWARD);
+            chain.apply_block(&b, &mut ledger).unwrap();
+        }
+        for _ in 0..2 {
+            let b = make_valid_block(&chain, miner_b, TESTNET_REWARD);
+            chain.apply_block(&b, &mut ledger).unwrap();
+        }
+
+        assert_eq!(chain.blocks_by_miner(&miner_a).len(), 3);
+        assert_eq!(chain.blocks_by_miner(&miner_b).len(), 2);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn test_daa_adjusts_difficulty() {
+        let (mut chain, path) = test_chain(TESTNET_DIFFICULTY);
+        let mut ledger = Ledger::new();
+        let miner = [9u8; 32];
+        let initial_diff = chain.difficulty;
+
+        // Mine DAA_WINDOW blocks with very fast timestamps (1ms apart)
+        for _ in 0..DAA_WINDOW {
+            let tip = chain.tip();
+            let mut b = Block {
+                index:     tip.index + 1,
+                prev_hash: tip.hash,
+                timestamp: tip.timestamp + 1, // very fast → difficulty should increase
+                miner,
+                nonce: 0,
+                hash: [0u8; 32],
+                reward: TESTNET_REWARD,
+                transactions: vec![],
+            };
+            b.hash = b.hash_header();
+            // Force-apply without difficulty check for the DAA test
+            let enc = bincode::serialize(&b).unwrap();
+            chain.db.put(block_key(b.index), &enc).unwrap();
+            chain.height = b.index;
+            chain.db.put(KEY_HEIGHT, &chain.height.to_le_bytes()).unwrap();
+            ledger.apply_coinbase(&miner, TESTNET_REWARD);
+        }
+        // Trigger DAA
+        if chain.height % DAA_WINDOW == 0 {
+            chain.difficulty = chain.compute_next_difficulty();
+        }
+
+        assert!(chain.difficulty > initial_diff, "difficulty should increase for fast blocks");
+        std::fs::remove_dir_all(path).ok();
+    }
+}

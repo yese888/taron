@@ -1,0 +1,22 @@
+[package]
+name = "taron-pool"
+version = "0.1.0"
+edition = "2021"
+description = "TARON mining pool server — share tracking, work distribution, payouts"
+
+[[bin]]
+name = "taron-pool"
+path = "src/main.rs"
+
+[dependencies]
+taron-core = { path = "../taron-core" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls"] }

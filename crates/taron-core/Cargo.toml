@@ -1,0 +1,24 @@
+[package]
+name = "taron-core"
+version = "0.1.0"
+edition = "2021"
+description = "TARON core — SEQUAL-256, transactions, ledger, PoSC"
+
+[dependencies]
+sha3 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+serde-big-array = "0.5"
+rocksdb = "0.23"
+bincode = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "finality_bench"
+harness = false

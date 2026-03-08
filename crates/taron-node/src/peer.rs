@@ -1,0 +1,249 @@
+//! Peer management — connection tracking, per-IP limits, scoring, and banning.
+
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
+use tracing::warn;
+
+/// Maximum outbound connections.
+pub const MAX_OUTBOUND: usize = 8;
+/// Maximum inbound connections.
+pub const MAX_INBOUND: usize = 16;
+/// Maximum simultaneous connections from a single IP.
+/// Set to 5 to accommodate home operators running multiple nodes on the same NAT.
+const MAX_CONNECTIONS_PER_IP: u32 = 5;
+/// Score threshold below which a peer IP is banned.
+const SCORE_BAN_THRESHOLD: i32 = -100;
+/// Duration a banned IP remains blocked.
+const BAN_DURATION: Duration = Duration::from_secs(3_600); // 1 hour
+
+/// Behavior penalty values.
+pub const PENALTY_INVALID_BLOCK: i32 = 40;
+pub const PENALTY_BAD_MESSAGE:    i32 = 20;
+
+/// Direction of a peer connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerDirection {
+    Inbound,
+    Outbound,
+}
+
+/// Information about a connected peer.
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub addr: SocketAddr,
+    pub direction: PeerDirection,
+    pub connected_at: Instant,
+    pub version: u8,
+    pub user_agent: String,
+    pub last_seen: Instant,
+    /// Behavior score — starts at 0, decremented for misbehavior. Ban at -100.
+    pub score: i32,
+}
+
+/// Manages connected peers: connection limits, per-IP caps, scoring, and banning.
+#[derive(Debug, Default)]
+pub struct PeerManager {
+    peers: HashMap<SocketAddr, PeerInfo>,
+    /// Active connection count per remote IP.
+    connections_per_ip: HashMap<IpAddr, u32>,
+    /// Banned IPs and the instant they were banned.
+    banned: HashMap<IpAddr, Instant>,
+}
+
+impl PeerManager {
+    pub fn new() -> Self {
+        Self {
+            peers: HashMap::new(),
+            connections_per_ip: HashMap::new(),
+            banned: HashMap::new(),
+        }
+    }
+
+    /// Returns true if the IP is currently banned (auto-expires after 1 hour).
+    pub fn is_banned(&mut self, ip: IpAddr) -> bool {
+        if let Some(&banned_at) = self.banned.get(&ip) {
+            if banned_at.elapsed() < BAN_DURATION {
+                return true;
+            }
+            self.banned.remove(&ip);
+        }
+        false
+    }
+
+    /// Apply a behavior penalty to a peer.
+    /// Returns true if the penalty pushed the score below the ban threshold —
+    /// the caller should then disconnect the peer.
+    pub fn penalize(&mut self, addr: &SocketAddr, points: i32) -> bool {
+        let ip = addr.ip();
+        if let Some(peer) = self.peers.get_mut(addr) {
+            peer.score -= points;
+            if peer.score < SCORE_BAN_THRESHOLD {
+                warn!("[P2P] Banning {} for 1 hour (score {})", ip, peer.score);
+                self.banned.insert(ip, Instant::now());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Number of connected peers.
+    pub fn count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Count of inbound peers.
+    pub fn inbound_count(&self) -> usize {
+        self.peers.values().filter(|p| p.direction == PeerDirection::Inbound).count()
+    }
+
+    /// Count of outbound peers.
+    pub fn outbound_count(&self) -> usize {
+        self.peers.values().filter(|p| p.direction == PeerDirection::Outbound).count()
+    }
+
+    /// Check if we can accept a new connection of the given direction.
+    pub fn can_accept(&self, direction: PeerDirection) -> bool {
+        match direction {
+            PeerDirection::Inbound => self.inbound_count() < MAX_INBOUND,
+            PeerDirection::Outbound => self.outbound_count() < MAX_OUTBOUND,
+        }
+    }
+
+    /// Register a new peer.
+    /// Returns false if the global limit, per-IP limit, or a ban blocks it.
+    pub fn add_peer(&mut self, addr: SocketAddr, direction: PeerDirection) -> bool {
+        let ip = addr.ip();
+        if self.is_banned(ip) {
+            return false;
+        }
+        let ip_count = self.connections_per_ip.get(&ip).copied().unwrap_or(0);
+        if ip_count >= MAX_CONNECTIONS_PER_IP {
+            return false;
+        }
+        if self.peers.contains_key(&addr) || !self.can_accept(direction) {
+            return false;
+        }
+        let now = Instant::now();
+        self.peers.insert(addr, PeerInfo {
+            addr,
+            direction,
+            connected_at: now,
+            version: 0,
+            user_agent: String::new(),
+            last_seen: now,
+            score: 0,
+        });
+        *self.connections_per_ip.entry(ip).or_insert(0) += 1;
+        true
+    }
+
+    /// Update peer info after receiving Hello.
+    pub fn update_hello(&mut self, addr: &SocketAddr, version: u8, user_agent: String) {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            peer.version = version;
+            peer.user_agent = user_agent;
+            peer.last_seen = Instant::now();
+        }
+    }
+
+    /// Mark a peer as recently seen (for keepalive).
+    pub fn touch(&mut self, addr: &SocketAddr) {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            peer.last_seen = Instant::now();
+        }
+    }
+
+    /// Remove a peer and update per-IP connection count.
+    pub fn remove_peer(&mut self, addr: &SocketAddr) {
+        if self.peers.remove(addr).is_some() {
+            let ip = addr.ip();
+            let count = self.connections_per_ip.entry(ip).or_insert(0);
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.connections_per_ip.remove(&ip);
+            }
+        }
+    }
+
+    /// Check if a peer is connected.
+    pub fn is_connected(&self, addr: &SocketAddr) -> bool {
+        self.peers.contains_key(addr)
+    }
+
+    /// Get all peer addresses.
+    pub fn all_addrs(&self) -> Vec<SocketAddr> {
+        self.peers.keys().copied().collect()
+    }
+
+    /// Get all peer infos.
+    pub fn all_peers(&self) -> Vec<&PeerInfo> {
+        self.peers.values().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{}", port).parse().unwrap()
+    }
+
+    #[test]
+    fn test_add_and_count() {
+        let mut pm = PeerManager::new();
+        assert!(pm.add_peer(addr(1000), PeerDirection::Outbound));
+        assert!(pm.add_peer(addr(1001), PeerDirection::Inbound));
+        assert_eq!(pm.count(), 2);
+        assert_eq!(pm.outbound_count(), 1);
+        assert_eq!(pm.inbound_count(), 1);
+    }
+
+    #[test]
+    fn test_no_duplicate() {
+        let mut pm = PeerManager::new();
+        assert!(pm.add_peer(addr(1000), PeerDirection::Outbound));
+        assert!(!pm.add_peer(addr(1000), PeerDirection::Outbound));
+        assert_eq!(pm.count(), 1);
+    }
+
+    #[test]
+    fn test_outbound_limit() {
+        let mut pm = PeerManager::new();
+        for i in 0..MAX_OUTBOUND {
+            assert!(pm.add_peer(addr(1000 + i as u16), PeerDirection::Outbound));
+        }
+        assert!(!pm.can_accept(PeerDirection::Outbound));
+        assert!(!pm.add_peer(addr(9999), PeerDirection::Outbound));
+    }
+
+    #[test]
+    fn test_inbound_limit() {
+        let mut pm = PeerManager::new();
+        for i in 0..MAX_INBOUND {
+            assert!(pm.add_peer(addr(2000 + i as u16), PeerDirection::Inbound));
+        }
+        assert!(!pm.can_accept(PeerDirection::Inbound));
+    }
+
+    #[test]
+    fn test_remove_peer() {
+        let mut pm = PeerManager::new();
+        pm.add_peer(addr(1000), PeerDirection::Outbound);
+        assert!(pm.is_connected(&addr(1000)));
+        pm.remove_peer(&addr(1000));
+        assert!(!pm.is_connected(&addr(1000)));
+        assert_eq!(pm.count(), 0);
+    }
+
+    #[test]
+    fn test_update_hello() {
+        let mut pm = PeerManager::new();
+        pm.add_peer(addr(1000), PeerDirection::Outbound);
+        pm.update_hello(&addr(1000), 1, "taron/0.1".into());
+        let peers = pm.all_peers();
+        assert_eq!(peers[0].version, 1);
+        assert_eq!(peers[0].user_agent, "taron/0.1");
+    }
+}

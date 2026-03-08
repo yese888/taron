@@ -1,0 +1,4 @@
+[workspace]
+members = ["crates/taron-core", "crates/taron-node", "crates/taron-cli", "crates/taron-crypto", "crates/taron-miner", "crates/taron-pool"]
+default-members = ["crates/taron-core", "crates/taron-node", "crates/taron-cli", "crates/taron-crypto", "crates/taron-miner"]
+resolver = "2"

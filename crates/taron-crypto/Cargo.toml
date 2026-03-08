@@ -1,0 +1,19 @@
+[package]
+name = "taron-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "TARON post-quantum cryptography — hybrid signatures & encrypted transport"
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+pqcrypto-dilithium = "0.5"
+pqcrypto-traits = "0.3"
+snow = "0.9"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+thiserror = "1"
+sha3 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
