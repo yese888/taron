@@ -389,6 +389,17 @@ impl Db {
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
+    /// Count distinct miner addresses with shares since `since_ms`.
+    pub async fn distinct_miners_since(&self, since_ms: u64) -> Result<usize, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT miner_address) FROM shares WHERE timestamp_ms >= $1",
+        )
+        .bind(since_ms as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count as usize)
+    }
+
     /// Sum of `amount_micro` paid to `address` across all payouts.
     pub async fn total_paid_to_miner(&self, address: &str) -> Result<u64, sqlx::Error> {
         let total: Option<i64> = sqlx::query_scalar(

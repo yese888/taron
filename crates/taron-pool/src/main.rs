@@ -409,13 +409,21 @@ async fn get_pool_status(State(pool): State<Pool>) -> Json<PoolStatusResponse> {
     let tmpl = pool.template.read().await;
     let round = pool.round.read().await;
     let blocks_found = *pool.blocks_found.read().await;
+
+    // Count active miners by recent share activity (last 2 minutes), not round state.
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH).unwrap_or_default()
+        .as_millis() as u64;
+    let since_2m = now_ms.saturating_sub(2 * 60 * 1000);
+    let active = pool.db.distinct_miners_since(since_2m).await.unwrap_or(0);
+
     Json(PoolStatusResponse {
         pool_address: pool.wallet.address(),
         pool_pubkey: hex::encode(pool.wallet.public_key()),
         current_block: tmpl.index,
         difficulty: tmpl.difficulty,
         share_difficulty: tmpl.share_difficulty,
-        active_miners: round.shares.len(),
+        active_miners: active,
         total_shares_this_round: round.total_shares,
         blocks_found,
         fee_percent: (POOL_FEE_PERMILLE as f64) / 10.0,
