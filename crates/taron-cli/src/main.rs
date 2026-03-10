@@ -522,8 +522,7 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         Err(e) => eprintln!(" [POOL] Share submit error: {}", e),
                                     }
-                                    // Refresh work after submitting a share
-                                    work = None;
+                                    // Let the 3s timer handle work refresh.
                                 }
 
                                 nonce = nonce.wrapping_add(1);

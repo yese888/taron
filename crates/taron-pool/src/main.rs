@@ -195,11 +195,23 @@ async fn submit_block_to_node(client: &reqwest::Client, block: &Block) -> bool {
 
 /// Estimate hashrate from a slice of shares.
 /// Each share represents on average `2^share_difficulty` hashes.
+/// Uses the actual time span between first and last share for accuracy,
+/// falling back to the provided window if there are fewer than 2 shares.
 fn estimate_hashrate(shares: &[ShareRecord], share_difficulty: u32, window_ms: u64) -> f64 {
+    if shares.is_empty() { return 0.0; }
     let hashes_per_share = (1u64 << share_difficulty.min(63)) as f64;
     let total_hashes = shares.len() as f64 * hashes_per_share;
-    let window_s = window_ms as f64 / 1000.0;
-    if window_s > 0.0 { total_hashes / window_s } else { 0.0 }
+    // Use actual time span between first and last share for a more stable estimate.
+    let span_ms = if shares.len() >= 2 {
+        let first = shares.iter().map(|s| s.timestamp_ms).min().unwrap_or(0);
+        let last = shares.iter().map(|s| s.timestamp_ms).max().unwrap_or(0);
+        let span = last.saturating_sub(first);
+        if span > 0 { span } else { window_ms }
+    } else {
+        window_ms
+    };
+    let span_s = span_ms as f64 / 1000.0;
+    if span_s > 0.0 { total_hashes / span_s } else { 0.0 }
 }
 
 // ── Payout logic ─────────────────────────────────────────────────────────────
