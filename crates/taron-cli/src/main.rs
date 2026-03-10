@@ -393,91 +393,136 @@ async fn main() -> anyhow::Result<()> {
                     println!(" [POOL] Miner address: {}", miner_address);
                     println!(" [POOL] Starting {} thread(s)...\n", threads);
 
-                    use std::sync::Arc;
+                    use std::sync::{Arc, Mutex};
                     use std::sync::atomic::{AtomicU64, Ordering};
+
+                    #[derive(Clone, serde::Deserialize)]
+                    struct WorkResp {
+                        block_index: u64,
+                        prev_hash: String,
+                        timestamp: u64,
+                        pool_pubkey: String,
+                        #[allow(dead_code)]
+                        difficulty: u32,
+                        share_difficulty: u32,
+                    }
+
+                    #[derive(serde::Serialize)]
+                    struct ShareMsg {
+                        miner_address: String,
+                        miner_pubkey: String,
+                        worker_name: String,
+                        nonce: u64,
+                        block_index: u64,
+                        timestamp: u64,
+                        prev_hash: String,
+                    }
 
                     let total_hashes = Arc::new(AtomicU64::new(0));
                     let total_shares = Arc::new(AtomicU64::new(0));
-                    // Shared latest block index — when any thread sees a new block,
-                    // all other threads invalidate their work immediately.
-                    let latest_block = Arc::new(AtomicU64::new(0));
+                    let shared_work: Arc<Mutex<Option<WorkResp>>> = Arc::new(Mutex::new(None));
+                    let (share_tx, share_rx) = std::sync::mpsc::channel::<ShareMsg>();
+
+                    // Dedicated thread: fetches work from pool every 2 seconds.
+                    // Mining threads never do HTTP — they just read shared_work.
+                    {
+                        let pool_url = pool_url.clone();
+                        let miner_address = miner_address.clone();
+                        let shared_work = shared_work.clone();
+                        std::thread::spawn(move || {
+                            let http = reqwest::blocking::Client::new();
+                            loop {
+                                let url = format!("{}/pool/work?address={}", pool_url, miner_address);
+                                if let Ok(resp) = http.get(&url).send().and_then(|r| r.json::<WorkResp>()) {
+                                    *shared_work.lock().unwrap() = Some(resp);
+                                }
+                                std::thread::sleep(std::time::Duration::from_secs(2));
+                            }
+                        });
+                    }
+
+                    // Dedicated thread: submits shares to pool via HTTP POST.
+                    {
+                        let pool_url = pool_url.clone();
+                        let total_shares = total_shares.clone();
+                        std::thread::spawn(move || {
+                            let http = reqwest::blocking::Client::new();
+                            for msg in share_rx {
+                                let url = format!("{}/pool/share", pool_url);
+                                match http.post(&url).json(&msg).send() {
+                                    Ok(resp) => {
+                                        #[derive(serde::Deserialize)]
+                                        struct ShareResp { accepted: bool, is_block: bool, #[allow(dead_code)] message: String }
+                                        if let Ok(r) = resp.json::<ShareResp>() {
+                                            if r.accepted {
+                                                let count = total_shares.fetch_add(1, Ordering::Relaxed) + 1;
+                                                if r.is_block {
+                                                    println!(" [POOL] ★ BLOCK FOUND! #{} (share #{})", msg.block_index, count);
+                                                } else {
+                                                    println!(" [POOL] Share #{} accepted (block #{})", count, msg.block_index);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => eprintln!(" [POOL] Share submit error: {}", e),
+                                }
+                            }
+                        });
+                    }
+
+                    // Wait for first work before spawning miners.
+                    println!(" [POOL] Waiting for work from pool...");
+                    loop {
+                        if shared_work.lock().unwrap().is_some() { break; }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    println!(" [POOL] Work received, starting {} mining threads\n", threads);
 
                     for thread_id in 0..threads {
-                        let pool_url = pool_url.clone();
                         let miner_address = miner_address.clone();
                         let miner_pubkey_hex = miner_pubkey_hex.clone();
                         let total_hashes = total_hashes.clone();
-                        let total_shares = total_shares.clone();
-                        let latest_block = latest_block.clone();
+                        let shared_work = shared_work.clone();
+                        let share_tx = share_tx.clone();
                         let worker = worker.clone();
 
                         std::thread::spawn(move || {
-                            let http = reqwest::blocking::Client::new();
-
-                            #[derive(serde::Deserialize)]
-                            struct WorkResp {
-                                block_index: u64,
-                                prev_hash: String,
-                                timestamp: u64,
-                                pool_pubkey: String,
-                                #[allow(dead_code)]
-                                difficulty: u32,
-                                share_difficulty: u32,
-                            }
-
-                            #[derive(serde::Serialize)]
-                            struct ShareReq<'a> {
-                                miner_address: &'a str,
-                                miner_pubkey: &'a str,
-                                worker_name: &'a str,
-                                nonce: u64,
-                                block_index: u64,
-                                timestamp: u64,
-                                prev_hash: &'a str,
-                            }
-
                             let mut nonce = thread_id as u64 * (u64::MAX / threads as u64);
-                            let mut work: Option<WorkResp> = None;
-                            let mut last_refresh = std::time::Instant::now();
+                            let mut cached_block_index = 0u64;
+                            let mut pool_pubkey_bytes = [0u8; 32];
+                            let mut prev_hash_bytes = [0u8; 32];
+                            let mut timestamp = 0u64;
+                            let mut share_difficulty = 16u32;
+                            let mut prev_hash_hex = String::new();
 
                             loop {
-                                // Refresh work: on startup, every 3 seconds, or when
-                                // another thread found a newer block.
-                                let need_refresh = work.is_none()
-                                    || last_refresh.elapsed().as_secs() >= 3
-                                    || work.as_ref().map_or(true, |w| {
-                                        latest_block.load(Ordering::Relaxed) > w.block_index
-                                    });
-
-                                if need_refresh {
-                                    let url = format!("{}/pool/work?address={}", pool_url, miner_address);
-                                    if let Ok(resp) = http.get(&url).send().and_then(|r| r.json::<WorkResp>()) {
-                                        // Notify all threads of the latest block index.
-                                        latest_block.fetch_max(resp.block_index, Ordering::Relaxed);
-                                        work = Some(resp);
-                                        last_refresh = std::time::Instant::now();
-                                    } else {
-                                        std::thread::sleep(std::time::Duration::from_secs(3));
-                                        continue;
+                                // Check for new work (lock-free read, very fast).
+                                if let Ok(guard) = shared_work.try_lock() {
+                                    if let Some(w) = guard.as_ref() {
+                                        if w.block_index != cached_block_index {
+                                            cached_block_index = w.block_index;
+                                            share_difficulty = w.share_difficulty;
+                                            timestamp = w.timestamp;
+                                            prev_hash_hex = w.prev_hash.clone();
+                                            if let Ok(b) = hex::decode(&w.pool_pubkey) {
+                                                if b.len() == 32 { pool_pubkey_bytes.copy_from_slice(&b); }
+                                            }
+                                            if let Ok(b) = hex::decode(&w.prev_hash) {
+                                                if b.len() == 32 { prev_hash_bytes.copy_from_slice(&b); }
+                                            }
+                                        }
                                     }
                                 }
 
-                                let w = match &work { Some(w) => w, None => continue };
-
-                                // Decode pool pubkey
-                                let pool_pubkey_bytes = match hex::decode(&w.pool_pubkey) {
-                                    Ok(b) if b.len() == 32 => { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); arr }
-                                    _ => { work = None; continue; }
-                                };
-                                let prev_hash_bytes = match hex::decode(&w.prev_hash) {
-                                    Ok(b) if b.len() == 32 => { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); arr }
-                                    _ => { work = None; continue; }
-                                };
+                                if cached_block_index == 0 {
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                    continue;
+                                }
 
                                 let candidate = Block {
-                                    index: w.block_index,
+                                    index: cached_block_index,
                                     prev_hash: prev_hash_bytes,
-                                    timestamp: w.timestamp,
+                                    timestamp,
                                     miner: pool_pubkey_bytes,
                                     nonce,
                                     hash: [0u8; 32],
@@ -488,41 +533,16 @@ async fn main() -> anyhow::Result<()> {
                                 let hash = candidate.hash_header();
                                 total_hashes.fetch_add(1, Ordering::Relaxed);
 
-                                if meets_difficulty(&hash, w.share_difficulty) {
-                                    let block_index = w.block_index;
-                                    let timestamp = w.timestamp;
-                                    let prev_hash = w.prev_hash.clone();
-                                    let share_req = ShareReq {
-                                        miner_address: &miner_address,
-                                        miner_pubkey: &miner_pubkey_hex,
-                                        worker_name: &worker,
+                                if meets_difficulty(&hash, share_difficulty) {
+                                    let _ = share_tx.send(ShareMsg {
+                                        miner_address: miner_address.clone(),
+                                        miner_pubkey: miner_pubkey_hex.clone(),
+                                        worker_name: worker.clone(),
                                         nonce,
-                                        block_index,
+                                        block_index: cached_block_index,
                                         timestamp,
-                                        prev_hash: &prev_hash,
-                                    };
-                                    let url = format!("{}/pool/share", pool_url);
-                                    match http.post(&url).json(&share_req).send() {
-                                        Ok(resp) => {
-                                            #[derive(serde::Deserialize)]
-                                            struct ShareResp { accepted: bool, is_block: bool, message: String }
-                                            if let Ok(r) = resp.json::<ShareResp>() {
-                                                if r.accepted {
-                                                    let count = total_shares.fetch_add(1, Ordering::Relaxed) + 1;
-                                                    if r.is_block {
-                                                        // Block found — all threads must refresh work now.
-                                                        latest_block.fetch_max(block_index + 1, Ordering::Relaxed);
-                                                        println!(" [POOL] ★ BLOCK FOUND! #{} (share #{})", block_index, count);
-                                                    } else {
-                                                        println!(" [POOL] Share #{} accepted (block #{})", count, block_index);
-                                                    }
-                                                }
-                                                // Don't print stale share rejections — they're normal
-                                            }
-                                        }
-                                        Err(e) => eprintln!(" [POOL] Share submit error: {}", e),
-                                    }
-                                    // Let the 3s timer handle work refresh.
+                                        prev_hash: prev_hash_hex.clone(),
+                                    });
                                 }
 
                                 nonce = nonce.wrapping_add(1);
