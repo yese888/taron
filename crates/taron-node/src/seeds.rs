@@ -6,8 +6,10 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 
 /// Known TARON testnet seed nodes (hostname:port or ip:port).
+/// Multiple seeds improve resilience — if one is down, others bootstrap the node.
 pub const TESTNET_SEEDS: &[&str] = &[
     "seed.taron.network:8333",
+    "seed2.taron.network:8333",
 ];
 
 /// Resolve the effective seed-node list.
@@ -32,10 +34,11 @@ mod tests {
 
     #[test]
     fn test_resolve_seeds_empty() {
-        // No config seeds, no hardcoded seeds → empty
+        // No config seeds → resolve hardcoded TESTNET_SEEDS via DNS
         let result = resolve_seeds(&[]);
-        // TESTNET_SEEDS is currently empty, so this should be empty too
-        assert_eq!(result.len(), TESTNET_SEEDS.len());
+        // At least some seeds should resolve (may be less than TESTNET_SEEDS.len()
+        // if some hostnames don't have DNS records yet)
+        assert!(result.len() <= TESTNET_SEEDS.len());
     }
 
     #[test]

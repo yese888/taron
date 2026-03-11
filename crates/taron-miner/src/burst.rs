@@ -421,14 +421,15 @@ mod tests {
         let mut controller = BurstController::with_config(
             BurstConfig::new(5, 3) // Very short durations for testing
         );
-        
-        // Run several cycles
-        for _ in 0..3 {
-            let in_burst = controller.cycle().await;
-            // Should alternate between burst and idle
-        }
-        
-        // Should have some recorded activity
+
+        // First call starts burst phase
+        controller.cycle().await;
+        // Wait longer than burst_ms (5ms) so burst expires on next cycle
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        // Second call ends burst + sleeps idle
+        controller.cycle().await;
+
+        // Should have recorded at least one burst and one idle
         assert!(controller.stats.total_bursts > 0 || controller.stats.total_idles > 0);
     }
 

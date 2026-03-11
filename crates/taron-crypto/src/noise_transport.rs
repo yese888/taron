@@ -214,7 +214,7 @@ mod tests {
         let id_a = NoiseIdentity::generate().unwrap();
         let id_b = NoiseIdentity::generate().unwrap();
 
-        let (mut transport_a, mut transport_b) = perform_handshake(&id_a, &id_b).unwrap();
+        let (transport_a, transport_b) = perform_handshake(&id_a, &id_b).unwrap();
 
         // A can see B's public key and vice versa
         assert!(transport_a.remote_public_key().is_some());

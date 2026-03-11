@@ -273,6 +273,7 @@ mod tests {
             nonce: 0,
             hash: [0u8; 32],
             reward: TESTNET_REWARD,
+            transactions: vec![],
         };
         block.hash = block.hash_header();
         assert!(quick_validate(&block));

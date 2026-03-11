@@ -235,7 +235,7 @@ impl ThermalGovernor {
 
     /// Get current mining intensity factor (0.1 - 1.0)
     pub fn intensity(&self) -> f32 {
-        self.state.read().intensity
+        self.state.read().intensity.clamp(MIN_INTENSITY, MAX_INTENSITY)
     }
 
     /// Check if system is in critical thermal state
@@ -340,12 +340,15 @@ mod tests {
     #[test]
     fn test_pid_controller() {
         let mut pid = PidController::new();
-        
-        // Test error correction
+
+        // PID needs measurable dt between calls — force time separation
+        std::thread::sleep(std::time::Duration::from_millis(10));
         let output1 = pid.compute(5.0); // High positive error
-        let output2 = pid.compute(2.0); // Lower error
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _output2 = pid.compute(2.0); // Lower error
+        std::thread::sleep(std::time::Duration::from_millis(10));
         let output3 = pid.compute(-1.0); // Negative error
-        
+
         // PID should respond to error changes
         assert!(output1 > 0.0); // Positive correction
         assert!(output3 < 0.0); // Negative correction

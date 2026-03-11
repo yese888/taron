@@ -71,7 +71,7 @@ impl Block {
         Block {
             index: 0,
             prev_hash: [0u8; 32],
-            timestamp: 1_772_992_800_000, // 2026-03-08 18:00:00 UTC in ms
+            timestamp: 1_772_975_700_000, // 2026-03-08 13:15:00 UTC in ms
             miner: [0u8; 32],
             nonce: 0,
             hash: genesis_hash,
@@ -144,7 +144,6 @@ impl Block {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TESTNET_DIFFICULTY;
 
     #[test]
     fn test_genesis_deterministic() {

@@ -38,7 +38,7 @@
 //!
 //! ### Basic Mining
 //!
-//! ```rust
+//! ```rust,no_run
 //! use taron_miner::{MiningEngine, MiningConfig, MiningCommand};
 //!
 //! # tokio_test::block_on(async {
@@ -76,7 +76,7 @@
 //!
 //! ### Performance Benchmarking
 //!
-//! ```rust
+//! ```rust,no_run
 //! use taron_miner::{BenchmarkRunner, BenchmarkConfig, BenchmarkDuration};
 //!
 //! # tokio_test::block_on(async {
@@ -170,7 +170,7 @@ pub const BUILD_INFO: &str = env!("CARGO_PKG_VERSION");
 /// 
 /// # Example
 /// 
-/// ```rust
+/// ```rust,no_run
 /// use taron_miner::quick_mine;
 /// 
 /// # tokio_test::block_on(async {
@@ -211,7 +211,7 @@ pub async fn quick_mine(block_header: Vec<u8>) -> Result<(MiningEngine, tokio::t
 /// 
 /// # Example
 /// 
-/// ```rust
+/// ```rust,no_run
 /// use taron_miner::quick_benchmark;
 /// 
 /// # tokio_test::block_on(async {

@@ -94,7 +94,10 @@ impl TaronNode {
             (chain, ledger)
         } else {
             {
-                let tmp = std::env::temp_dir().join(format!("taron_node_{}", std::process::id()));
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static COUNTER: AtomicU64 = AtomicU64::new(0);
+                let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+                let tmp = std::env::temp_dir().join(format!("taron_node_{}_{}", std::process::id(), n));
                 let chain = Blockchain::load_or_create(&tmp, TESTNET_DIFFICULTY);
                 (chain, Ledger::new())
             }
@@ -697,6 +700,18 @@ async fn handle_messages(
                                 stream,
                                 &Message::GetBlocks { from, to },
                             ).await?;
+                        } else if block_index == our_h + 1 {
+                            // Next block but doesn't link to our tip — peer is on a fork
+                            // Request their recent blocks so the Blocks handler can deep-reorg
+                            let fork_start = if our_h > 10 { our_h - 10 } else { 1 };
+                            info!(
+                                "[FORK] NewBlock #{} from {} doesn't chain to our tip — requesting blocks {}..{} for reorg comparison",
+                                block_index, addr, fork_start, block_index
+                            );
+                            protocol::send_message(
+                                stream,
+                                &Message::GetBlocks { from: fork_start, to: block_index },
+                            ).await?;
                         } else if block_index == our_h {
                             // Competing block at same height — check if it has a better (lower) hash
                             let current_tip = blockchain.read().await.tip();
@@ -819,13 +834,15 @@ async fn handle_messages(
             }
 
             Message::Blocks(blocks) => {
-                // Batch block sync — apply each in order
+                // Batch block sync — apply each in order, with deep reorg support
                 if blocks.is_empty() {
                     let h = blockchain.read().await.height();
                     info!("[SYNC] Sync complete — height: {}", h);
                 } else {
                     let mut applied = 0usize;
                     let mut last_height = 0u64;
+                    let mut fork_handled = false;
+
                     for block in &blocks {
                         let result = {
                             let mut chain = blockchain.write().await;
@@ -838,6 +855,54 @@ async fn handle_messages(
                                 last_height = block.index;
                                 let hash_prefix = hex::encode(&block.hash[..5]);
                                 info!("[SYNC] Applied block #{} | hash: {}…", block.index, hash_prefix);
+                            }
+                            Err(_) if !fork_handled => {
+                                // Block doesn't apply — try deep reorg if incoming chain is longer
+                                let mut chain = blockchain.write().await;
+                                let incoming_max = blocks.iter().map(|b| b.index).max().unwrap_or(0);
+                                if incoming_max <= chain.height() {
+                                    warn!("[SYNC] Incoming chain tip {} ≤ our height {} — no reorg", incoming_max, chain.height());
+                                    break;
+                                }
+                                let fork_point = chain.find_fork_point(&blocks);
+                                if let Some(fp) = fork_point {
+                                    if fp < chain.height() && chain.height() - fp <= 10 {
+                                        info!(
+                                            "[REORG] Fork detected at height {} (our tip: {}) — reverting {} blocks",
+                                            fp, chain.height(), chain.height() - fp
+                                        );
+                                        let mut ledger_state = ledger.write().await;
+                                        match chain.revert_to_height(fp, &mut *ledger_state) {
+                                            Ok(reverted) => {
+                                                info!("[REORG] Reverted {} blocks to height {}", reverted.len(), fp);
+                                                // Now apply all incoming blocks from the fork point
+                                                for new_block in &blocks {
+                                                    if new_block.index <= fp { continue; }
+                                                    match chain.apply_block_ibd(new_block, &mut *ledger_state) {
+                                                        Ok(()) => {
+                                                            applied += 1;
+                                                            last_height = new_block.index;
+                                                            info!("[REORG] Applied block #{}", new_block.index);
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("[REORG] Block #{} failed after reorg: {}", new_block.index, e);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                fork_handled = true;
+                                            }
+                                            Err(e) => {
+                                                warn!("[REORG] Revert failed: {} — keeping current chain", e);
+                                            }
+                                        }
+                                    } else {
+                                        warn!("[SYNC] Fork too deep (fork_point: {}, tip: {}) — skipping", fp, chain.height());
+                                    }
+                                } else {
+                                    warn!("[SYNC] Block #{} rejected: no common ancestor found", block.index);
+                                }
+                                if fork_handled { break; } else { break; }
                             }
                             Err(e) => {
                                 warn!("[SYNC] Block #{} rejected: {}", block.index, e);

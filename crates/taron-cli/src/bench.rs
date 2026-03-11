@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn test_bench_operation() {
         let result = bench_operation("test", 10, || {
-            std::thread::sleep(Duration::from_micros(100));
+            std::thread::sleep(std::time::Duration::from_micros(100));
         });
         assert_eq!(result.iterations, 10);
         assert!(result.mean_ms > 0.0);

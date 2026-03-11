@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Maximum outbound connections.
-pub const MAX_OUTBOUND: usize = 8;
+pub const MAX_OUTBOUND: usize = 16;
 /// Maximum inbound connections.
-pub const MAX_INBOUND: usize = 16;
+pub const MAX_INBOUND: usize = 32;
 /// Maximum simultaneous connections from a single IP.
 /// Set to 5 to accommodate home operators running multiple nodes on the same NAT.
 const MAX_CONNECTIONS_PER_IP: u32 = 5;
@@ -208,21 +208,30 @@ mod tests {
         assert_eq!(pm.count(), 1);
     }
 
+    /// Helper: create addresses with unique IPs to avoid per-IP limit
+    fn unique_addr(i: usize) -> SocketAddr {
+        // Use 10.x.y.z to get unique IPs (up to 16M)
+        let b1 = ((i >> 16) & 0xFF) as u8;
+        let b2 = ((i >> 8) & 0xFF) as u8;
+        let b3 = (i & 0xFF) as u8;
+        format!("10.{}.{}.{}:8333", b1, b2, b3).parse().unwrap()
+    }
+
     #[test]
     fn test_outbound_limit() {
         let mut pm = PeerManager::new();
         for i in 0..MAX_OUTBOUND {
-            assert!(pm.add_peer(addr(1000 + i as u16), PeerDirection::Outbound));
+            assert!(pm.add_peer(unique_addr(i), PeerDirection::Outbound));
         }
         assert!(!pm.can_accept(PeerDirection::Outbound));
-        assert!(!pm.add_peer(addr(9999), PeerDirection::Outbound));
+        assert!(!pm.add_peer(unique_addr(9999), PeerDirection::Outbound));
     }
 
     #[test]
     fn test_inbound_limit() {
         let mut pm = PeerManager::new();
         for i in 0..MAX_INBOUND {
-            assert!(pm.add_peer(addr(2000 + i as u16), PeerDirection::Inbound));
+            assert!(pm.add_peer(unique_addr(1000 + i), PeerDirection::Inbound));
         }
         assert!(!pm.can_accept(PeerDirection::Inbound));
     }

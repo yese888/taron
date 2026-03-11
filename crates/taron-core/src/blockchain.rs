@@ -144,6 +144,33 @@ impl Blockchain {
         Ok(tip)
     }
 
+    /// Revert the chain back to `target_height` by calling `revert_tip()` repeatedly.
+    /// Returns the list of reverted blocks (newest first) on success.
+    /// Used for deep reorgs when a longer competing chain is discovered.
+    pub fn revert_to_height(&mut self, target_height: u64, ledger: &mut Ledger) -> Result<Vec<Block>, TaronError> {
+        let mut reverted = Vec::new();
+        while self.height > target_height {
+            let block = self.revert_tip(ledger)?;
+            reverted.push(block);
+        }
+        Ok(reverted)
+    }
+
+    /// Find the fork point between our chain and a set of incoming blocks.
+    /// Returns the height of the last common ancestor, or None if no common block found.
+    pub fn find_fork_point(&self, incoming: &[Block]) -> Option<u64> {
+        for block in incoming {
+            if block.index == 0 { return Some(0); }
+            let parent_height = block.index - 1;
+            if let Some(our_block) = self.block_at(parent_height) {
+                if our_block.hash == block.prev_hash {
+                    return Some(parent_height);
+                }
+            }
+        }
+        None
+    }
+
     /// Validate and append a new block, then credit the miner in the ledger.
     /// The block is written to RocksDB atomically before returning.
     pub fn apply_block(&mut self, block: &Block, ledger: &mut Ledger) -> Result<(), TaronError> {
@@ -346,10 +373,14 @@ mod tests {
 
     fn make_valid_block(chain: &Blockchain, miner: [u8; 32], reward: u64) -> Block {
         let tip = chain.tip();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         let mut candidate = Block {
             index: tip.index + 1,
             prev_hash: tip.hash,
-            timestamp: tip.timestamp + 1_000,
+            timestamp: now_ms,
             miner,
             nonce: 0,
             hash: [0u8; 32],
