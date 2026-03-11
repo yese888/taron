@@ -859,21 +859,30 @@ async fn get_miner_hashrate(
     let share_diff = tmpl.share_difficulty;
     drop(tmpl);
 
-    let hashes_per_share = (1u64 << share_diff) as f64;
-    let bucket_s = bucket_ms as f64 / 1000.0;
-
-    let buckets = pool.db
-        .shares_by_miner_bucketed(&q.address, since_ms, bucket_ms)
+    // Fetch all miner shares in range and group by bucket + worker
+    let all_shares = pool.db.shares_by_miner_since_full(&q.address, since_ms)
         .await
         .unwrap_or_default();
 
-    let points = buckets
-        .into_iter()
-        .map(|(bucket_start, count)| MinerHashratePoint {
-            timestamp_ms: bucket_start,
-            hashrate_hps: count as f64 * hashes_per_share / bucket_s,
-        })
-        .collect();
+    // Group shares into time buckets
+    let mut bucket_map: std::collections::BTreeMap<u64, Vec<ShareRecord>> = std::collections::BTreeMap::new();
+    for s in &all_shares {
+        let bucket_start = (s.timestamp_ms / bucket_ms) * bucket_ms;
+        bucket_map.entry(bucket_start).or_default().push(s.clone());
+    }
+
+    // For each bucket, compute hashrate as sum of per-worker hashrates
+    let points: Vec<MinerHashratePoint> = bucket_map.into_iter().map(|(bucket_start, shares)| {
+        let mut per_worker: std::collections::HashMap<String, Vec<ShareRecord>> = std::collections::HashMap::new();
+        for s in shares {
+            per_worker.entry(s.worker_name.clone()).or_default().push(s);
+        }
+        let mut hr = 0.0f64;
+        for (_w, ws) in &per_worker {
+            hr += estimate_hashrate(ws, share_diff, bucket_ms);
+        }
+        MinerHashratePoint { timestamp_ms: bucket_start, hashrate_hps: hr }
+    }).collect();
 
     Json(MinerHashrateResponse { points })
 }

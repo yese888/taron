@@ -223,6 +223,35 @@ impl Db {
             .collect())
     }
 
+    /// Full share records for a miner since a given timestamp.
+    pub async fn shares_by_miner_since_full(
+        &self,
+        address: &str,
+        since_ms: u64,
+    ) -> Result<Vec<ShareRecord>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT timestamp_ms, miner_address, miner_pubkey, worker_name, nonce, block_index, is_block \
+             FROM shares WHERE miner_address = $1 AND timestamp_ms >= $2",
+        )
+        .bind(address)
+        .bind(since_ms as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| ShareRecord {
+                timestamp_ms:  r.get::<i64, _>("timestamp_ms") as u64,
+                miner_address: r.get("miner_address"),
+                miner_pubkey:  r.get("miner_pubkey"),
+                worker_name:   r.get("worker_name"),
+                nonce:         r.get::<i64, _>("nonce") as u64,
+                block_index:   r.get::<i64, _>("block_index") as u64,
+                is_block:      r.get("is_block"),
+            })
+            .collect())
+    }
+
     /// Count shares by `address` with `timestamp_ms >= since_ms`.
     pub async fn shares_by_miner_since(
         &self,
@@ -343,33 +372,6 @@ impl Db {
         .fetch_one(&self.pool)
         .await?;
         Ok(ts.unwrap_or(0) as u64)
-    }
-
-    /// Shares for `address` grouped into `bucket_ms`-wide time buckets since `since_ms`.
-    /// Returns `(bucket_start_ms, count)` pairs ordered by time.
-    pub async fn shares_by_miner_bucketed(
-        &self,
-        address: &str,
-        since_ms: u64,
-        bucket_ms: u64,
-    ) -> Result<Vec<(u64, u64)>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT (timestamp_ms / $3) * $3 AS bucket, COUNT(*) AS cnt \
-             FROM shares \
-             WHERE miner_address = $1 AND timestamp_ms >= $2 \
-             GROUP BY bucket \
-             ORDER BY bucket ASC",
-        )
-        .bind(address)
-        .bind(since_ms as i64)
-        .bind(bucket_ms as i64)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .iter()
-            .map(|r| (r.get::<i64, _>(0) as u64, r.get::<i64, _>(1) as u64))
-            .collect())
     }
 
     /// Returns `{address → pubkey_hex}` for all miners with shares since `since_ms`.
