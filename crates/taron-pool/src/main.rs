@@ -314,16 +314,17 @@ async fn snapshot_task(pool: Pool, db: Arc<Db>) {
         let two_min_ago = now.saturating_sub(2 * 60 * 1000);
         let shares = db.shares_since(two_min_ago).await.unwrap_or_default();
 
-        // Sum per-miner hashrates for consistent pool total
+        // Sum per-worker hashrates for consistent pool total
         let mut miners_set = std::collections::HashSet::new();
-        let mut per_miner: std::collections::HashMap<String, Vec<ShareRecord>> = std::collections::HashMap::new();
+        let mut per_worker: std::collections::HashMap<String, Vec<ShareRecord>> = std::collections::HashMap::new();
         for s in &shares {
             miners_set.insert(s.miner_address.clone());
-            per_miner.entry(s.miner_address.clone()).or_default().push(s.clone());
+            let key = format!("{}:{}", s.miner_address, s.worker_name);
+            per_worker.entry(key).or_default().push(s.clone());
         }
         let mut hashrate = 0.0f64;
-        for (_addr, miner_shares) in &per_miner {
-            hashrate += estimate_hashrate(miner_shares, share_difficulty, 2 * 60 * 1000);
+        for (_key, worker_shares) in &per_worker {
+            hashrate += estimate_hashrate(worker_shares, share_difficulty, 2 * 60 * 1000);
         }
         let active_miners = miners_set.len() as u32;
 
@@ -430,17 +431,18 @@ async fn get_pool_status(State(pool): State<Pool>) -> Json<PoolStatusResponse> {
     let active = pool.db.distinct_miners_since(since_2m).await.unwrap_or(0);
     let recent_shares = pool.db.shares_since(since_2m).await.unwrap_or_default();
 
-    // Pool hashrate = sum of per-miner hashrates
+    // Pool hashrate = sum of per-worker hashrates (consistent with miner page)
     let share_diff = tmpl.share_difficulty;
-    let mut per_miner: std::collections::HashMap<String, Vec<ShareRecord>> = std::collections::HashMap::new();
+    let mut per_worker: std::collections::HashMap<String, Vec<ShareRecord>> = std::collections::HashMap::new();
     let mut workers_set = std::collections::HashSet::new();
     for s in &recent_shares {
-        per_miner.entry(s.miner_address.clone()).or_default().push(s.clone());
-        workers_set.insert(format!("{}:{}", s.miner_address, s.worker_name));
+        let key = format!("{}:{}", s.miner_address, s.worker_name);
+        workers_set.insert(key.clone());
+        per_worker.entry(key).or_default().push(s.clone());
     }
     let mut pool_hashrate = 0.0f64;
-    for (_addr, miner_shares) in &per_miner {
-        pool_hashrate += estimate_hashrate(miner_shares, share_diff, 2 * 60 * 1000);
+    for (_key, worker_shares) in &per_worker {
+        pool_hashrate += estimate_hashrate(worker_shares, share_diff, 2 * 60 * 1000);
     }
 
     let total_paid = pool.db.total_paid().await.unwrap_or(0);
