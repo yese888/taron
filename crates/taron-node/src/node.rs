@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock};
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::sync::{Mutex, RwLock, mpsc};
 use taron_core::{Block, Blockchain, Transaction, Ledger, Wallet, TransactionStatus, TESTNET_DIFFICULTY};
 use tracing::{debug, info, warn};
 
@@ -307,32 +308,10 @@ impl TaronNode {
         }
     }
 
-    /// Broadcast a transaction to all connected peers.
+    /// Broadcast a transaction to all connected peers via persistent connections.
     pub async fn broadcast_tx(&self, tx: &Transaction) {
-        let tx_hash = tx.hash_hex();
-        let peer_addrs = self.peers.lock().await.all_addrs();
-
-        for addr in peer_addrs {
-            self.peer_known_txs.write().await.insert((addr, tx_hash.clone()));
-
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(5),
-                    TcpStream::connect(addr),
-                ).await {
-                    Ok(Ok(mut stream)) => {
-                        let _ = protocol::send_message(&mut stream, &Message::Tx { tx }).await;
-                    }
-                    Ok(Err(e)) => {
-                        debug!("[BROADCAST] Tx send to {} failed: {}", addr, e);
-                    }
-                    Err(_) => {
-                        debug!("[BROADCAST] Tx send to {} timed out", addr);
-                    }
-                }
-            });
-        }
+        let peers = self.peers.lock().await;
+        peers.broadcast(Message::Tx { tx: tx.clone() }, None);
     }
 
     /// Broadcast a newly-mined block to all connected peers.
@@ -366,37 +345,16 @@ impl TaronNode {
 
     pub async fn broadcast_block(&self, block: &Block) {
         let block_hash = hex::encode(&block.hash[..8]);
-        let peer_addrs = self.peers.lock().await.all_addrs();
+        let peers = self.peers.lock().await;
 
         info!(
             "[BROADCAST] Block #{} hash: {}… → {} peers",
             block.index,
             block_hash,
-            peer_addrs.len()
+            peers.count()
         );
 
-        for addr in peer_addrs {
-            let block = block.clone();
-            let block_index = block.index;
-            tokio::spawn(async move {
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(5),
-                    TcpStream::connect(addr),
-                ).await {
-                    Ok(Ok(mut stream)) => {
-                        if let Err(e) = protocol::send_message(&mut stream, &Message::NewBlock(block)).await {
-                            warn!("[BROADCAST] Block #{} send to {} failed: {}", block_index, addr, e);
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        warn!("[BROADCAST] Block #{} connect to {} failed: {}", block_index, addr, e);
-                    }
-                    Err(_) => {
-                        warn!("[BROADCAST] Block #{} connect to {} timed out", block_index, addr);
-                    }
-                }
-            });
-        }
+        peers.broadcast(Message::NewBlock(block.clone()), None);
     }
 }
 
@@ -420,34 +378,51 @@ async fn connect_to_peer(
         }
     }
 
-    let mut stream = TcpStream::connect(addr).await?;
+    let stream = TcpStream::connect(addr).await?;
     info!("Connected to peer {}", addr);
 
-    // Send Hello
-    protocol::send_message(&mut stream, &Message::Hello {
+    // Split stream into read/write halves for concurrent access
+    let (mut read_half, mut write_half) = stream.into_split();
+
+    // Create broadcast channel for this peer
+    let (btx, mut brx) = mpsc::unbounded_channel::<Message>();
+    {
+        let mut pm = peers.lock().await;
+        pm.set_broadcast_tx(&addr, btx.clone());
+    }
+
+    // Spawn writer task — sends messages from the channel to the stream
+    let writer_addr = addr;
+    let writer_handle = tokio::spawn(async move {
+        while let Some(msg) = brx.recv().await {
+            if protocol::send_message(&mut write_half, &msg).await.is_err() {
+                debug!("[P2P] Writer to {} failed — closing", writer_addr);
+                break;
+            }
+        }
+    });
+
+    // Send Hello + handshake via the channel
+    let _ = btx.send(Message::Hello {
         version: 1,
         listen_port: our_port,
         user_agent: "taron/0.2.0".into(),
-    }).await?;
+    });
+    let _ = btx.send(Message::GetChainHeight);
+    let _ = btx.send(Message::GetPeers);
+    let _ = btx.send(Message::GetTxHashes);
 
-    // Chain-sync handshake: ask peer for their chain height (triggers IBD if needed)
-    protocol::send_message(&mut stream, &Message::GetChainHeight).await?;
+    // Handle incoming messages (reads from read_half, sends responses via btx)
+    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers).await;
 
-    // Peer exchange: request peer list to discover more nodes
-    protocol::send_message(&mut stream, &Message::GetPeers).await?;
-
-    // State sync: request tx hashes
-    protocol::send_message(&mut stream, &Message::GetTxHashes).await?;
-
-    // Handle messages
-    let result = handle_messages(&mut stream, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers).await;
+    writer_handle.abort();
     peers.lock().await.remove_peer(&addr);
     result
 }
 
 /// Handle an accepted peer connection.
 async fn handle_peer(
-    mut stream: TcpStream,
+    stream: TcpStream,
     addr: SocketAddr,
     our_port: u16,
     mempool: Arc<RwLock<Mempool>>,
@@ -459,22 +434,50 @@ async fn handle_peer(
     data_dir: Option<PathBuf>,
     discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
 ) -> io::Result<()> {
-    // Send Hello
-    protocol::send_message(&mut stream, &Message::Hello {
+    // Split stream into read/write halves
+    let (mut read_half, mut write_half) = stream.into_split();
+
+    // Create broadcast channel for this peer
+    let (btx, mut brx) = mpsc::unbounded_channel::<Message>();
+    {
+        let mut pm = peers.lock().await;
+        pm.set_broadcast_tx(&addr, btx.clone());
+    }
+
+    // Spawn writer task
+    let writer_addr = addr;
+    let writer_handle = tokio::spawn(async move {
+        while let Some(msg) = brx.recv().await {
+            if protocol::send_message(&mut write_half, &msg).await.is_err() {
+                debug!("[P2P] Writer to {} failed — closing", writer_addr);
+                break;
+            }
+        }
+    });
+
+    // Send Hello + announce height via channel
+    let _ = btx.send(Message::Hello {
         version: 1,
         listen_port: our_port,
         user_agent: "taron/0.2.0".into(),
-    }).await?;
+    });
+    let _ = btx.send(Message::GetChainHeight);
 
-    // Announce our height so the inbound peer can sync from us if needed
-    protocol::send_message(&mut stream, &Message::GetChainHeight).await?;
+    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers).await;
 
-    handle_messages(&mut stream, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers).await
+    writer_handle.abort();
+    result
+}
+
+/// Send a response message to a peer via its channel. Returns Err if channel closed.
+fn send_to_peer(tx: &mpsc::UnboundedSender<Message>, msg: Message) -> io::Result<()> {
+    tx.send(msg).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "peer channel closed"))
 }
 
 /// Message processing loop for a peer connection.
 async fn handle_messages(
-    stream: &mut TcpStream,
+    reader: &mut OwnedReadHalf,
+    out_tx: &mpsc::UnboundedSender<Message>,
     addr: SocketAddr,
     _our_port: u16,
     mempool: Arc<RwLock<Mempool>>,
@@ -490,7 +493,7 @@ async fn handle_messages(
     let mut peer_height: Option<u64> = None;
 
     loop {
-        let msg = protocol::recv_message(stream).await?;
+        let msg = protocol::recv_message(reader).await?;
 
         match msg {
             Message::Hello { version, user_agent, .. } => {
@@ -498,7 +501,7 @@ async fn handle_messages(
             }
 
             Message::Ping { nonce } => {
-                protocol::send_message(stream, &Message::Pong { nonce }).await?;
+                send_to_peer(out_tx, Message::Pong { nonce })?;
                 peers.lock().await.touch(&addr);
             }
 
@@ -508,7 +511,7 @@ async fn handle_messages(
 
             Message::GetPeers => {
                 let addrs = peers.lock().await.all_addrs();
-                protocol::send_message(stream, &Message::Peers { addrs }).await?;
+                send_to_peer(out_tx, Message::Peers { addrs })?;
             }
 
             Message::Peers { addrs } => {
@@ -570,29 +573,15 @@ async fn handle_messages(
 
                                 // Send ACK back to originator
                                 let ack = finality.create_ack(tx_hash);
-                                protocol::send_message(stream, &Message::TxAck(ack.clone())).await?;
+                                send_to_peer(out_tx, Message::TxAck(ack.clone()))?;
                                 debug!("[ACK] Sent ACK for {} to {}", &tx_hash_hex[..16], addr);
 
-                                // Relay tx and ACK to other peers
-                                let other_peers: Vec<SocketAddr> = {
-                                    let pm = peers.lock().await;
-                                    pm.all_addrs().into_iter().filter(|a| *a != addr).collect()
-                                };
+                                // Relay tx and ACK to other peers via persistent connections
                                 drop(pool);
-
-                                for peer_addr in other_peers {
-                                    let already_known = known.read().await.contains(&(peer_addr, tx_hash_hex.clone()));
-                                    if !already_known {
-                                        known.write().await.insert((peer_addr, tx_hash_hex.clone()));
-                                        let tx = tx.clone();
-                                        let ack = ack.clone();
-                                        tokio::spawn(async move {
-                                            if let Ok(mut s) = TcpStream::connect(peer_addr).await {
-                                                let _ = protocol::send_message(&mut s, &Message::Tx { tx }).await;
-                                                let _ = protocol::send_message(&mut s, &Message::TxAck(ack)).await;
-                                            }
-                                        });
-                                    }
+                                {
+                                    let pm = peers.lock().await;
+                                    pm.broadcast(Message::Tx { tx: tx.clone() }, Some(&addr));
+                                    pm.broadcast(Message::TxAck(ack), Some(&addr));
                                 }
                             }
                             Ok(false) => {
@@ -611,7 +600,7 @@ async fn handle_messages(
 
             Message::GetTxHashes => {
                 let hashes = mempool.read().await.tx_hashes();
-                protocol::send_message(stream, &Message::TxHashes { hashes }).await?;
+                send_to_peer(out_tx, Message::TxHashes { hashes })?;
             }
 
             Message::TxHashes { hashes } => {
@@ -620,7 +609,7 @@ async fn handle_messages(
                     hashes.into_iter().filter(|h| !pool.contains(h)).collect()
                 };
                 if !missing.is_empty() {
-                    protocol::send_message(stream, &Message::GetTxs { hashes: missing }).await?;
+                    send_to_peer(out_tx, Message::GetTxs { hashes: missing })?;
                 }
             }
 
@@ -628,7 +617,7 @@ async fn handle_messages(
                 let pool = mempool.read().await;
                 let txs = pool.get_txs(&hashes);
                 for tx in txs {
-                    protocol::send_message(stream, &Message::Tx { tx }).await?;
+                    send_to_peer(out_tx, Message::Tx { tx })?;
                 }
             }
 
@@ -670,19 +659,10 @@ async fn handle_messages(
                             ledger_state.save(&dir.join("ledger.bin"));
                         }
 
-                        // Relay block to other connected peers
-                        let other_peers: Vec<SocketAddr> = {
+                        // Relay block to other connected peers via persistent connections
+                        {
                             let pm = peers.lock().await;
-                            pm.all_addrs().into_iter().filter(|a| *a != addr).collect()
-                        };
-
-                        for peer_addr in other_peers {
-                            let block = block.clone();
-                            tokio::spawn(async move {
-                                if let Ok(mut s) = TcpStream::connect(peer_addr).await {
-                                    let _ = protocol::send_message(&mut s, &Message::NewBlock(block)).await;
-                                }
-                            });
+                            pm.broadcast(Message::NewBlock(block.clone()), Some(&addr));
                         }
                     }
                     Err(e) => {
@@ -696,10 +676,7 @@ async fn handle_messages(
                             );
                             let from = our_h + 1;
                             let to = (from + crate::sync::IBD_CHUNK_SIZE - 1).min(block_index);
-                            protocol::send_message(
-                                stream,
-                                &Message::GetBlocks { from, to },
-                            ).await?;
+                            send_to_peer(out_tx, Message::GetBlocks { from, to })?;
                         } else if block_index == our_h + 1 {
                             // Next block but doesn't link to our tip — peer is on a fork
                             // Request their recent blocks so the Blocks handler can deep-reorg
@@ -708,10 +685,7 @@ async fn handle_messages(
                                 "[FORK] NewBlock #{} from {} doesn't chain to our tip — requesting blocks {}..{} for reorg comparison",
                                 block_index, addr, fork_start, block_index
                             );
-                            protocol::send_message(
-                                stream,
-                                &Message::GetBlocks { from: fork_start, to: block_index },
-                            ).await?;
+                            send_to_peer(out_tx, Message::GetBlocks { from: fork_start, to: block_index })?;
                         } else if block_index == our_h {
                             // Competing block at same height — check if it has a better (lower) hash
                             let current_tip = blockchain.read().await.tip();
@@ -759,18 +733,10 @@ async fn handle_messages(
                                                     }
                                                 }
 
-                                                // Relay the better block
-                                                let other_peers: Vec<SocketAddr> = {
+                                                // Relay the better block via persistent connections
+                                                {
                                                     let pm = peers.lock().await;
-                                                    pm.all_addrs().into_iter().filter(|a| *a != addr).collect()
-                                                };
-                                                for peer_addr in other_peers {
-                                                    let block = block.clone();
-                                                    tokio::spawn(async move {
-                                                        if let Ok(mut s) = TcpStream::connect(peer_addr).await {
-                                                            let _ = protocol::send_message(&mut s, &Message::NewBlock(block)).await;
-                                                        }
-                                                    });
+                                                    pm.broadcast(Message::NewBlock(block.clone()), Some(&addr));
                                                 }
                                             } else {
                                                 warn!("[REORG] Failed to apply competing block #{} — reverting", block_index);
@@ -807,7 +773,7 @@ async fn handle_messages(
 
             Message::GetChainHeight => {
                 let height = blockchain.read().await.height();
-                protocol::send_message(stream, &Message::ChainHeight(height)).await?;
+                send_to_peer(out_tx, Message::ChainHeight(height))?;
             }
 
             Message::ChainHeight(peer_h) => {
@@ -821,7 +787,7 @@ async fn handle_messages(
                     let from = our_h + 1;
                     let to = (from + crate::sync::IBD_CHUNK_SIZE - 1).min(peer_h);
                     info!("[SYNC] Downloading blocks {}..{} from {}", from, to, addr);
-                    protocol::send_message(stream, &Message::GetBlocks { from, to }).await?;
+                    send_to_peer(out_tx, Message::GetBlocks { from, to })?;
                 } else {
                     info!("[SYNC] Peer {} height {} — already in sync (height {})", addr, peer_h, our_h);
                 }
@@ -830,7 +796,7 @@ async fn handle_messages(
             Message::GetBlocks { from, to } => {
                 let chain = blockchain.read().await;
                 let blocks = chain.blocks_range(from, to);
-                protocol::send_message(stream, &Message::Blocks(blocks)).await?;
+                send_to_peer(out_tx, Message::Blocks(blocks))?;
             }
 
             Message::Blocks(blocks) => {
@@ -928,7 +894,7 @@ async fn handle_messages(
                                 let from = our_h + 1;
                                 let to = (from + crate::sync::IBD_CHUNK_SIZE - 1).min(ph);
                                 info!("[SYNC] Continuing IBD: downloading blocks {}..{} from {}", from, to, addr);
-                                protocol::send_message(stream, &Message::GetBlocks { from, to }).await?;
+                                send_to_peer(out_tx, Message::GetBlocks { from, to })?;
                             } else {
                                 info!("[SYNC] IBD complete — height: {}", our_h);
                             }
@@ -960,19 +926,10 @@ async fn handle_messages(
                         _ => {}
                     }
 
-                    // Relay ACK to other peers
-                    let other_peers: Vec<SocketAddr> = {
+                    // Relay ACK to other peers via persistent connections
+                    {
                         let pm = peers.lock().await;
-                        pm.all_addrs().into_iter().filter(|a| *a != addr).collect()
-                    };
-
-                    for peer_addr in other_peers {
-                        let ack = ack.clone();
-                        tokio::spawn(async move {
-                            if let Ok(mut s) = TcpStream::connect(peer_addr).await {
-                                let _ = protocol::send_message(&mut s, &Message::TxAck(ack)).await;
-                            }
-                        });
+                        pm.broadcast(Message::TxAck(ack), Some(&addr));
                     }
                 }
             }
@@ -993,11 +950,11 @@ async fn handle_messages(
                     (0, false)
                 };
 
-                protocol::send_message(stream, &Message::TxStatus {
+                send_to_peer(out_tx, Message::TxStatus {
                     tx_hash,
                     acks,
                     is_final,
-                }).await?;
+                })?;
             }
 
             Message::TxStatus { tx_hash, acks, is_final } => {

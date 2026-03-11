@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use taron_core::{Block, Transaction, TxAck};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 /// Maximum message payload size (1MB).
 pub const MAX_MESSAGE_SIZE: u32 = 1_048_576;
@@ -91,8 +90,8 @@ pub enum Message {
     },
 }
 
-/// Send a message over a TCP stream (length-prefixed JSON).
-pub async fn send_message(stream: &mut TcpStream, msg: &Message) -> std::io::Result<()> {
+/// Send a message over a stream (length-prefixed JSON).
+pub async fn send_message(writer: &mut (impl AsyncWriteExt + Unpin), msg: &Message) -> std::io::Result<()> {
     let payload = serde_json::to_vec(msg)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if payload.len() > MAX_MESSAGE_SIZE as usize {
@@ -102,16 +101,16 @@ pub async fn send_message(stream: &mut TcpStream, msg: &Message) -> std::io::Res
         ));
     }
     let len = (payload.len() as u32).to_be_bytes();
-    stream.write_all(&len).await?;
-    stream.write_all(&payload).await?;
-    stream.flush().await?;
+    writer.write_all(&len).await?;
+    writer.write_all(&payload).await?;
+    writer.flush().await?;
     Ok(())
 }
 
-/// Receive a message from a TCP stream (length-prefixed JSON).
-pub async fn recv_message(stream: &mut TcpStream) -> std::io::Result<Message> {
+/// Receive a message from a stream (length-prefixed JSON).
+pub async fn recv_message(reader: &mut (impl AsyncReadExt + Unpin)) -> std::io::Result<Message> {
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
+    reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf);
     if len > MAX_MESSAGE_SIZE {
         return Err(std::io::Error::new(
@@ -120,7 +119,7 @@ pub async fn recv_message(stream: &mut TcpStream) -> std::io::Result<Message> {
         ));
     }
     let mut payload = vec![0u8; len as usize];
-    stream.read_exact(&mut payload).await?;
+    reader.read_exact(&mut payload).await?;
     serde_json::from_slice(&payload)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
@@ -128,7 +127,7 @@ pub async fn recv_message(stream: &mut TcpStream) -> std::io::Result<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     #[tokio::test]
     async fn test_send_recv_hello() {

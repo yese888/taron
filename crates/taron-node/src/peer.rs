@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
+
+use crate::protocol::Message;
 
 /// Maximum outbound connections.
 pub const MAX_OUTBOUND: usize = 16;
@@ -39,6 +42,10 @@ pub struct PeerInfo {
     pub last_seen: Instant,
     /// Behavior score — starts at 0, decremented for misbehavior. Ban at -100.
     pub score: i32,
+    /// Channel for sending messages to this peer's writer task.
+    /// None until the peer handler sets it up.
+    #[allow(clippy::type_complexity)]
+    broadcast_tx: Option<UnboundedSender<Message>>,
 }
 
 /// Manages connected peers: connection limits, per-IP caps, scoring, and banning.
@@ -133,6 +140,7 @@ impl PeerManager {
             user_agent: String::new(),
             last_seen: now,
             score: 0,
+            broadcast_tx: None,
         });
         *self.connections_per_ip.entry(ip).or_insert(0) += 1;
         true
@@ -179,6 +187,25 @@ impl PeerManager {
     /// Get all peer infos.
     pub fn all_peers(&self) -> Vec<&PeerInfo> {
         self.peers.values().collect()
+    }
+
+    /// Set the broadcast channel sender for a peer (called after stream split).
+    pub fn set_broadcast_tx(&mut self, addr: &SocketAddr, tx: UnboundedSender<Message>) {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            peer.broadcast_tx = Some(tx);
+        }
+    }
+
+    /// Broadcast a message to all connected peers, optionally excluding one.
+    pub fn broadcast(&self, msg: Message, exclude: Option<&SocketAddr>) {
+        for (addr, peer) in &self.peers {
+            if let Some(excl) = exclude {
+                if addr == excl { continue; }
+            }
+            if let Some(ref tx) = peer.broadcast_tx {
+                let _ = tx.send(msg.clone());
+            }
+        }
     }
 }
 
