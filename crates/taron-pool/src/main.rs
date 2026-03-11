@@ -310,9 +310,9 @@ async fn snapshot_task(pool: Pool, db: Arc<Db>) {
         let share_difficulty = tmpl.share_difficulty;
         drop(tmpl);
 
-        // Use 2-minute window for hashrate (consistent with miner/worker endpoints)
-        let two_min_ago = now.saturating_sub(2 * 60 * 1000);
-        let shares = db.shares_since(two_min_ago).await.unwrap_or_default();
+        // Use 5-minute window for snapshots (smoother graph than 2min)
+        let five_min_ago = now.saturating_sub(5 * 60 * 1000);
+        let shares = db.shares_since(five_min_ago).await.unwrap_or_default();
 
         // Sum per-worker hashrates for consistent pool total
         let mut miners_set = std::collections::HashSet::new();
@@ -324,7 +324,7 @@ async fn snapshot_task(pool: Pool, db: Arc<Db>) {
         }
         let mut hashrate = 0.0f64;
         for (_key, worker_shares) in &per_worker {
-            hashrate += estimate_hashrate(worker_shares, share_difficulty, 2 * 60 * 1000);
+            hashrate += estimate_hashrate(worker_shares, share_difficulty, 5 * 60 * 1000);
         }
         let active_miners = miners_set.len() as u32;
 
