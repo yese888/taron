@@ -401,6 +401,15 @@ impl Db {
     }
 
     /// Sum of `amount_micro` paid to `address` across all payouts.
+    pub async fn total_paid(&self) -> Result<u64, sqlx::Error> {
+        let total: Option<i64> = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(amount_micro), 0)::bigint FROM payouts",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(total.unwrap_or(0) as u64)
+    }
+
     pub async fn total_paid_to_miner(&self, address: &str) -> Result<u64, sqlx::Error> {
         let total: Option<i64> = sqlx::query_scalar(
             "SELECT COALESCE(SUM(amount_micro), 0)::bigint FROM payouts WHERE to_address = $1",

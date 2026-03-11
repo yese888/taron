@@ -310,9 +310,9 @@ async fn snapshot_task(pool: Pool, db: Arc<Db>) {
         let share_difficulty = tmpl.share_difficulty;
         drop(tmpl);
 
-        let ten_min_ago = now.saturating_sub(600_000);
-        let shares = db.shares_since(ten_min_ago).await.unwrap_or_default();
-        let hashrate = estimate_hashrate(&shares, share_difficulty, 600_000);
+        let thirty_min_ago = now.saturating_sub(1_800_000);
+        let shares = db.shares_since(thirty_min_ago).await.unwrap_or_default();
+        let hashrate = estimate_hashrate(&shares, share_difficulty, 1_800_000);
 
         let round = pool.round.read().await;
         let active_miners = round.shares.len() as u32;
@@ -403,6 +403,7 @@ struct PoolStatusResponse {
     total_shares_this_round: u64,
     blocks_found: u64,
     fee_percent: f64,
+    total_paid: u64,
 }
 
 async fn get_pool_status(State(pool): State<Pool>) -> Json<PoolStatusResponse> {
@@ -417,6 +418,8 @@ async fn get_pool_status(State(pool): State<Pool>) -> Json<PoolStatusResponse> {
     let since_2m = now_ms.saturating_sub(2 * 60 * 1000);
     let active = pool.db.distinct_miners_since(since_2m).await.unwrap_or(0);
 
+    let total_paid = pool.db.total_paid().await.unwrap_or(0);
+
     Json(PoolStatusResponse {
         pool_address: pool.wallet.address(),
         pool_pubkey: hex::encode(pool.wallet.public_key()),
@@ -427,6 +430,7 @@ async fn get_pool_status(State(pool): State<Pool>) -> Json<PoolStatusResponse> {
         total_shares_this_round: round.total_shares,
         blocks_found,
         fee_percent: (POOL_FEE_PERMILLE as f64) / 10.0,
+        total_paid,
     })
 }
 
@@ -700,22 +704,24 @@ async fn get_miners(State(pool): State<Pool>) -> Json<MinersResponse> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH).unwrap_or_default()
         .as_millis() as u64;
+    let since_2m = now_ms.saturating_sub(2 * 60 * 1000);
     let since_24h = now_ms.saturating_sub(24 * 3600 * 1000);
 
-    // Snapshot round state then release lock before async DB calls.
-    let (total, addresses): (u64, Vec<(String, u64)>) = {
-        let round = pool.round.read().await;
-        let addresses = round.shares.iter().map(|(a, &s)| (a.clone(), s)).collect();
-        (round.total_shares, addresses)
-    };
+    let recent = pool.db.shares_since(since_2m).await.unwrap_or_default();
+
+    let mut share_map: HashMap<String, u64> = HashMap::new();
+    for s in &recent {
+        *share_map.entry(s.miner_address.clone()).or_insert(0) += 1;
+    }
+    let total: u64 = share_map.values().sum();
 
     let mut miners = Vec::new();
-    for (addr, shares) in addresses {
-        let shares_24h = pool.db.shares_by_miner_since(&addr, since_24h).await.unwrap_or(0);
+    for (addr, shares) in &share_map {
+        let shares_24h = pool.db.shares_by_miner_since(addr, since_24h).await.unwrap_or(0);
         miners.push(MinerEntry {
-            address: addr,
-            shares,
-            share_percent: if total > 0 { shares as f64 / total as f64 * 100.0 } else { 0.0 },
+            address: addr.clone(),
+            shares: *shares,
+            share_percent: if total > 0 { *shares as f64 / total as f64 * 100.0 } else { 0.0 },
             shares_24h,
         });
     }
