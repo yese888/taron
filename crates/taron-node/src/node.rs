@@ -65,6 +65,8 @@ pub struct TaronNode {
     pub peers: Arc<Mutex<PeerManager>>,
     /// Tracks which peers have which tx hashes (for gossip dedup).
     peer_known_txs: Arc<RwLock<HashSet<(SocketAddr, String)>>>,
+    /// Peers discovered via peer exchange, not yet connected.
+    discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
     /// The ledger containing all account states.
     pub ledger: Arc<RwLock<Ledger>>,
     /// The blockchain (ordered chain of validated blocks).
@@ -104,6 +106,7 @@ impl TaronNode {
             mempool: Arc::new(RwLock::new(Mempool::new())),
             peers: Arc::new(Mutex::new(PeerManager::new())),
             peer_known_txs: Arc::new(RwLock::new(HashSet::new())),
+            discovered_peers: Arc::new(RwLock::new(HashSet::new())),
             ledger: Arc::new(RwLock::new(ledger)),
             blockchain: Arc::new(RwLock::new(blockchain)),
             finality: Arc::new(finality),
@@ -127,6 +130,7 @@ impl TaronNode {
             mempool: Arc::new(RwLock::new(Mempool::new())),
             peers: Arc::new(Mutex::new(PeerManager::new())),
             peer_known_txs: Arc::new(RwLock::new(HashSet::new())),
+            discovered_peers: Arc::new(RwLock::new(HashSet::new())),
             ledger: Arc::new(RwLock::new(ledger)),
             blockchain: Arc::new(RwLock::new(
                 Blockchain::load_or_create(&chain_path, TESTNET_DIFFICULTY)
@@ -181,9 +185,71 @@ impl TaronNode {
             let finality = self.finality.clone();
             let port = self.config.listen_port;
             let data_dir = self.data_dir.clone();
+            let discovered = self.discovered_peers.clone();
             tokio::spawn(async move {
-                if let Err(e) = connect_to_peer(seed, port, mempool, peers, known, ledger, blockchain, finality, data_dir).await {
+                if let Err(e) = connect_to_peer(seed, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered).await {
                     warn!("Failed to connect to seed {}: {}", seed, e);
+                }
+            });
+        }
+
+        // Background reconnection task: maintain outbound peer count
+        {
+            let peers = self.peers.clone();
+            let mempool = self.mempool.clone();
+            let known = self.peer_known_txs.clone();
+            let ledger = self.ledger.clone();
+            let blockchain = self.blockchain.clone();
+            let finality = self.finality.clone();
+            let data_dir = self.data_dir.clone();
+            let port = self.config.listen_port;
+            let config_seeds = self.config.seed_nodes.clone();
+            let discovered = self.discovered_peers.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                    let (outbound, can_accept) = {
+                        let pm = peers.lock().await;
+                        (pm.outbound_count(), pm.can_accept(PeerDirection::Outbound))
+                    };
+                    if !can_accept { continue; }
+
+                    // Collect candidates: seeds + discovered peers
+                    let mut candidates: Vec<SocketAddr> = Vec::new();
+                    if outbound < 2 {
+                        candidates.extend(resolve_seeds(&config_seeds));
+                    }
+                    // Drain discovered peers
+                    {
+                        let mut disc = discovered.write().await;
+                        candidates.extend(disc.drain());
+                    }
+
+                    // Filter already-connected
+                    let connected = peers.lock().await.all_addrs();
+                    let connected_ips: HashSet<_> = connected.iter().map(|a| a.ip()).collect();
+                    candidates.retain(|a| !connected_ips.contains(&a.ip()));
+
+                    if !candidates.is_empty() {
+                        info!("[P2P] {} outbound peers — trying {} candidates", outbound, candidates.len());
+                    }
+
+                    for candidate in candidates {
+                        if !peers.lock().await.can_accept(PeerDirection::Outbound) { break; }
+                        let mempool = mempool.clone();
+                        let peers = peers.clone();
+                        let known = known.clone();
+                        let ledger = ledger.clone();
+                        let blockchain = blockchain.clone();
+                        let finality = finality.clone();
+                        let data_dir = data_dir.clone();
+                        let discovered = discovered.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = connect_to_peer(candidate, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered).await {
+                                debug!("[P2P] Connect to {} failed: {}", candidate, e);
+                            }
+                        });
+                    }
                 }
             });
         }
@@ -227,9 +293,10 @@ impl TaronNode {
             let finality = self.finality.clone();
             let port = self.config.listen_port;
             let data_dir = self.data_dir.clone();
+            let discovered = self.discovered_peers.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_peer(stream, addr, port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir).await {
+                if let Err(e) = handle_peer(stream, addr, port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered).await {
                     debug!("Peer {} disconnected: {}", addr, e);
                 }
                 peers.lock().await.remove_peer(&addr);
@@ -247,8 +314,19 @@ impl TaronNode {
 
             let tx = tx.clone();
             tokio::spawn(async move {
-                if let Ok(mut stream) = TcpStream::connect(addr).await {
-                    let _ = protocol::send_message(&mut stream, &Message::Tx { tx }).await;
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(addr),
+                ).await {
+                    Ok(Ok(mut stream)) => {
+                        let _ = protocol::send_message(&mut stream, &Message::Tx { tx }).await;
+                    }
+                    Ok(Err(e)) => {
+                        debug!("[BROADCAST] Tx send to {} failed: {}", addr, e);
+                    }
+                    Err(_) => {
+                        debug!("[BROADCAST] Tx send to {} timed out", addr);
+                    }
                 }
             });
         }
@@ -296,9 +374,23 @@ impl TaronNode {
 
         for addr in peer_addrs {
             let block = block.clone();
+            let block_index = block.index;
             tokio::spawn(async move {
-                if let Ok(mut stream) = TcpStream::connect(addr).await {
-                    let _ = protocol::send_message(&mut stream, &Message::NewBlock(block)).await;
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(addr),
+                ).await {
+                    Ok(Ok(mut stream)) => {
+                        if let Err(e) = protocol::send_message(&mut stream, &Message::NewBlock(block)).await {
+                            warn!("[BROADCAST] Block #{} send to {} failed: {}", block_index, addr, e);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        warn!("[BROADCAST] Block #{} connect to {} failed: {}", block_index, addr, e);
+                    }
+                    Err(_) => {
+                        warn!("[BROADCAST] Block #{} connect to {} timed out", block_index, addr);
+                    }
                 }
             });
         }
@@ -316,6 +408,7 @@ async fn connect_to_peer(
     blockchain: Arc<RwLock<Blockchain>>,
     finality: Arc<NodeFinalityManager>,
     data_dir: Option<PathBuf>,
+    discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
 ) -> io::Result<()> {
     {
         let mut pm = peers.lock().await;
@@ -337,11 +430,14 @@ async fn connect_to_peer(
     // Chain-sync handshake: ask peer for their chain height (triggers IBD if needed)
     protocol::send_message(&mut stream, &Message::GetChainHeight).await?;
 
+    // Peer exchange: request peer list to discover more nodes
+    protocol::send_message(&mut stream, &Message::GetPeers).await?;
+
     // State sync: request tx hashes
     protocol::send_message(&mut stream, &Message::GetTxHashes).await?;
 
     // Handle messages
-    let result = handle_messages(&mut stream, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir).await;
+    let result = handle_messages(&mut stream, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers).await;
     peers.lock().await.remove_peer(&addr);
     result
 }
@@ -358,6 +454,7 @@ async fn handle_peer(
     blockchain: Arc<RwLock<Blockchain>>,
     finality: Arc<NodeFinalityManager>,
     data_dir: Option<PathBuf>,
+    discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
 ) -> io::Result<()> {
     // Send Hello
     protocol::send_message(&mut stream, &Message::Hello {
@@ -369,7 +466,7 @@ async fn handle_peer(
     // Announce our height so the inbound peer can sync from us if needed
     protocol::send_message(&mut stream, &Message::GetChainHeight).await?;
 
-    handle_messages(&mut stream, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir).await
+    handle_messages(&mut stream, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers).await
 }
 
 /// Message processing loop for a peer connection.
@@ -384,6 +481,7 @@ async fn handle_messages(
     blockchain: Arc<RwLock<Blockchain>>,
     finality: Arc<NodeFinalityManager>,
     data_dir: Option<PathBuf>,
+    discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
 ) -> io::Result<()> {
     // Track the peer's reported chain height so IBD can continue chunk by chunk.
     let mut peer_height: Option<u64> = None;
@@ -410,8 +508,19 @@ async fn handle_messages(
                 protocol::send_message(stream, &Message::Peers { addrs }).await?;
             }
 
-            Message::Peers { .. } => {
-                // Could add new peers here; for now just acknowledge
+            Message::Peers { addrs } => {
+                let current_addrs = peers.lock().await.all_addrs();
+                let current_ips: HashSet<_> = current_addrs.iter().map(|a| a.ip()).collect();
+                let new_peers: Vec<_> = addrs.into_iter()
+                    .filter(|a| !current_ips.contains(&a.ip()))
+                    .collect();
+                if !new_peers.is_empty() {
+                    info!("[P2P] Discovered {} new peers from {}", new_peers.len(), addr);
+                    let mut disc = discovered_peers.write().await;
+                    for p in new_peers {
+                        disc.insert(p);
+                    }
+                }
             }
 
             Message::Tx { tx } => {
