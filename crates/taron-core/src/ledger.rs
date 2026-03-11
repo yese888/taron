@@ -238,6 +238,27 @@ impl Ledger {
         Ok(())
     }
 
+    /// Revert a transaction — undo the effects of apply_tx.
+    /// Credits amount+fee back to sender, debits amount from recipient.
+    pub fn revert_tx(&mut self, tx: &Transaction) {
+        let total_cost = tx.total_cost();
+
+        // Undo recipient credit
+        let recipient = self.get_account_mut(&tx.recipient);
+        recipient.balance = recipient.balance.saturating_sub(tx.amount);
+
+        // Undo sender debit
+        let sender = self.get_account_mut(&tx.sender);
+        sender.balance += total_cost;
+        sender.sequence = sender.sequence.saturating_sub(1);
+    }
+
+    /// Revert a coinbase reward — undo the effects of apply_coinbase.
+    pub fn revert_coinbase(&mut self, pubkey: &[u8; 32], amount: u64) {
+        let account = self.get_account_mut(pubkey);
+        account.balance = account.balance.saturating_sub(amount);
+    }
+
     /// Apply a coinbase transaction (mining reward)
     ///
     /// This creates or credits an account with mining rewards

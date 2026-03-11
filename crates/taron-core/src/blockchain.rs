@@ -112,6 +112,38 @@ impl Blockchain {
 
     // ── Mutation ─────────────────────────────────────────────────────────────
 
+    /// Revert the tip block: remove it from RocksDB, decrement height,
+    /// and undo its effects on the ledger (coinbase + transactions).
+    /// Returns the reverted block on success.
+    /// Used for tip reorg when a competing block with a better hash arrives.
+    pub fn revert_tip(&mut self, ledger: &mut Ledger) -> Result<Block, TaronError> {
+        if self.height == 0 {
+            return Err(TaronError::InvalidBlock); // never revert genesis
+        }
+        let tip = self.tip();
+
+        // Undo transactions in reverse order
+        for tx in tip.transactions.iter().rev() {
+            ledger.revert_tx(tx);
+        }
+
+        // Undo coinbase reward
+        ledger.revert_coinbase(&tip.miner, tip.reward);
+
+        // Remove block from DB and update height
+        self.db.delete(block_key(self.height)).expect("rocksdb delete block");
+        self.height -= 1;
+        self.db.put(KEY_HEIGHT, &self.height.to_le_bytes()).expect("rocksdb put height");
+
+        // Restore difficulty from the previous tip if we're at a DAA boundary
+        if (self.height + 1) % DAA_WINDOW == 0 {
+            self.difficulty = self.compute_next_difficulty();
+            self.db.put(KEY_DIFF, &self.difficulty.to_le_bytes()).expect("rocksdb put diff");
+        }
+
+        Ok(tip)
+    }
+
     /// Validate and append a new block, then credit the miner in the ledger.
     /// The block is written to RocksDB atomically before returning.
     pub fn apply_block(&mut self, block: &Block, ledger: &mut Ledger) -> Result<(), TaronError> {

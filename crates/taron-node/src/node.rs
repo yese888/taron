@@ -588,18 +588,93 @@ async fn handle_messages(
                                 stream,
                                 &Message::GetBlocks { from, to },
                             ).await?;
+                        } else if block_index == our_h {
+                            // Competing block at same height — check if it has a better (lower) hash
+                            let current_tip = blockchain.read().await.tip();
+                            if block.hash < current_tip.hash {
+                                // Better hash → reorg tip
+                                let mut chain = blockchain.write().await;
+                                let mut ledger_state = ledger.write().await;
+
+                                // Verify the competing block links to our parent
+                                let parent = chain.block_at(our_h - 1);
+                                if let Some(parent) = parent {
+                                    if block.prev_hash == parent.hash
+                                        && block.is_valid(&parent, chain.difficulty)
+                                        && block.reward == taron_core::TESTNET_REWARD
+                                    {
+                                        // Revert current tip
+                                        if let Ok(reverted) = chain.revert_tip(&mut *ledger_state) {
+                                            // Apply the better competing block
+                                            if chain.apply_block(&block, &mut *ledger_state).is_ok() {
+                                                info!(
+                                                    "[REORG] Tip #{} replaced: {}… → {}… (lower hash wins)",
+                                                    block_index,
+                                                    hex::encode(&reverted.hash[..8]),
+                                                    hex::encode(&block.hash[..8])
+                                                );
+                                                drop(chain);
+                                                drop(ledger_state);
+
+                                                // Persist
+                                                if let Some(ref dir) = data_dir {
+                                                    let chain = blockchain.read().await;
+                                                    let ledger_state = ledger.read().await;
+                                                    chain.save(&dir.join("chain.db"));
+                                                    ledger_state.save(&dir.join("ledger.bin"));
+                                                }
+
+                                                // Re-add reverted block's txs to mempool
+                                                {
+                                                    let mut mp = mempool.write().await;
+                                                    for tx in &reverted.transactions {
+                                                        mp.remove(&tx.hash_hex());
+                                                    }
+                                                    for tx in &block.transactions {
+                                                        mp.remove(&tx.hash_hex());
+                                                    }
+                                                }
+
+                                                // Relay the better block
+                                                let other_peers: Vec<SocketAddr> = {
+                                                    let pm = peers.lock().await;
+                                                    pm.all_addrs().into_iter().filter(|a| *a != addr).collect()
+                                                };
+                                                for peer_addr in other_peers {
+                                                    let block = block.clone();
+                                                    tokio::spawn(async move {
+                                                        if let Ok(mut s) = TcpStream::connect(peer_addr).await {
+                                                            let _ = protocol::send_message(&mut s, &Message::NewBlock(block)).await;
+                                                        }
+                                                    });
+                                                }
+                                            } else {
+                                                warn!("[REORG] Failed to apply competing block #{} — reverting", block_index);
+                                                // Re-apply the original tip
+                                                let _ = chain.apply_block(&reverted, &mut *ledger_state);
+                                            }
+                                        }
+                                    } else {
+                                        debug!("[BLOCK] Competing #{} from {} doesn't link to parent — ignored", block_index, addr);
+                                    }
+                                }
+                            } else {
+                                debug!("[BLOCK] Competing #{} from {} has worse hash — ignored", block_index, addr);
+                            }
                         } else {
                             warn!(
                                 "[BLOCK] #{} rejected from {} ({})",
                                 block_index, addr, e
                             );
-                            // Penalize peer for sending an invalid block.
-                            let banned = peers.lock().await
-                                .penalize(&addr, crate::peer::PENALTY_INVALID_BLOCK);
-                            if banned {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::Other, "peer banned"
-                                ));
+                            // Only penalize for truly old/invalid blocks, not competing ones
+                            if block_index < our_h {
+                                let banned = peers.lock().await
+                                    .penalize(&addr, crate::peer::PENALTY_INVALID_BLOCK);
+                                if banned {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::Other, "peer banned"
+                                    ));
+                                }
                             }
                         }
                     }
