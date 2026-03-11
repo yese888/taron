@@ -310,13 +310,22 @@ async fn snapshot_task(pool: Pool, db: Arc<Db>) {
         let share_difficulty = tmpl.share_difficulty;
         drop(tmpl);
 
-        let thirty_min_ago = now.saturating_sub(1_800_000);
-        let shares = db.shares_since(thirty_min_ago).await.unwrap_or_default();
-        let hashrate = estimate_hashrate(&shares, share_difficulty, 1_800_000);
+        // Use 2-minute window for hashrate (consistent with miner/worker endpoints)
+        let two_min_ago = now.saturating_sub(2 * 60 * 1000);
+        let shares = db.shares_since(two_min_ago).await.unwrap_or_default();
 
-        let round = pool.round.read().await;
-        let active_miners = round.shares.len() as u32;
-        drop(round);
+        // Sum per-miner hashrates for consistent pool total
+        let mut miners_set = std::collections::HashSet::new();
+        let mut per_miner: std::collections::HashMap<String, Vec<ShareRecord>> = std::collections::HashMap::new();
+        for s in &shares {
+            miners_set.insert(s.miner_address.clone());
+            per_miner.entry(s.miner_address.clone()).or_default().push(s.clone());
+        }
+        let mut hashrate = 0.0f64;
+        for (_addr, miner_shares) in &per_miner {
+            hashrate += estimate_hashrate(miner_shares, share_difficulty, 2 * 60 * 1000);
+        }
+        let active_miners = miners_set.len() as u32;
 
         let snap = HashrateSnapshot { timestamp_ms: now, hashrate_hps: hashrate, active_miners };
         if let Err(e) = db.insert_hashrate_snapshot(&snap).await {
@@ -400,6 +409,8 @@ struct PoolStatusResponse {
     difficulty: u32,
     share_difficulty: u32,
     active_miners: usize,
+    active_workers: usize,
+    pool_hashrate: f64,
     total_shares_this_round: u64,
     blocks_found: u64,
     fee_percent: f64,
@@ -411,12 +422,26 @@ async fn get_pool_status(State(pool): State<Pool>) -> Json<PoolStatusResponse> {
     let round = pool.round.read().await;
     let blocks_found = *pool.blocks_found.read().await;
 
-    // Count active miners by recent share activity (last 2 minutes), not round state.
+    // Count active miners/workers and compute pool hashrate from recent shares (2 min)
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH).unwrap_or_default()
         .as_millis() as u64;
     let since_2m = now_ms.saturating_sub(2 * 60 * 1000);
     let active = pool.db.distinct_miners_since(since_2m).await.unwrap_or(0);
+    let recent_shares = pool.db.shares_since(since_2m).await.unwrap_or_default();
+
+    // Pool hashrate = sum of per-miner hashrates
+    let share_diff = tmpl.share_difficulty;
+    let mut per_miner: std::collections::HashMap<String, Vec<ShareRecord>> = std::collections::HashMap::new();
+    let mut workers_set = std::collections::HashSet::new();
+    for s in &recent_shares {
+        per_miner.entry(s.miner_address.clone()).or_default().push(s.clone());
+        workers_set.insert(format!("{}:{}", s.miner_address, s.worker_name));
+    }
+    let mut pool_hashrate = 0.0f64;
+    for (_addr, miner_shares) in &per_miner {
+        pool_hashrate += estimate_hashrate(miner_shares, share_diff, 2 * 60 * 1000);
+    }
 
     let total_paid = pool.db.total_paid().await.unwrap_or(0);
 
@@ -427,6 +452,8 @@ async fn get_pool_status(State(pool): State<Pool>) -> Json<PoolStatusResponse> {
         difficulty: tmpl.difficulty,
         share_difficulty: tmpl.share_difficulty,
         active_miners: active,
+        active_workers: workers_set.len(),
+        pool_hashrate,
         total_shares_this_round: round.total_shares,
         blocks_found,
         fee_percent: (POOL_FEE_PERMILLE as f64) / 10.0,
@@ -754,22 +781,26 @@ async fn get_miner_stats(
         .as_millis() as u64;
 
     let since_24h = now_ms.saturating_sub(24 * 3600 * 1000);
-    let since_10m = now_ms.saturating_sub(10 * 60 * 1000);
 
     let shares_24h = pool.db.shares_by_miner_since(&q.address, since_24h).await.unwrap_or(0);
     let total_paid = pool.db.total_paid_to_miner(&q.address).await.unwrap_or(0);
 
-    // Hashrate from last 10-minute window
+    // Hashrate = sum of per-worker hashrates (consistent with workers endpoint)
     let tmpl = pool.template.read().await;
     let share_diff = tmpl.share_difficulty;
     drop(tmpl);
 
-    let recent_shares = pool.db.shares_since(since_10m).await.unwrap_or_default();
-    let miner_recent: Vec<_> = recent_shares
-        .into_iter()
-        .filter(|s| s.miner_address == q.address)
-        .collect();
-    let hashrate = estimate_hashrate(&miner_recent, share_diff, 10 * 60 * 1000);
+    let since_2m = now_ms.saturating_sub(2 * 60 * 1000);
+    let recent_shares = pool.db.shares_since(since_2m).await.unwrap_or_default();
+    let worker_list = pool.db.workers_for_miner(&q.address).await.unwrap_or_default();
+    let mut hashrate = 0.0f64;
+    for (worker_name, _) in &worker_list {
+        let worker_recent: Vec<_> = recent_shares.iter()
+            .filter(|s| s.miner_address == q.address && s.worker_name == *worker_name)
+            .cloned()
+            .collect();
+        hashrate += estimate_hashrate(&worker_recent, share_diff, 2 * 60 * 1000);
+    }
 
     let last_share_ms = pool.db.last_share_ms(&q.address).await.unwrap_or(0);
 
