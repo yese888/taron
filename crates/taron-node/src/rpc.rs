@@ -23,9 +23,10 @@ use tracing::info;
 /// Per-IP request counter: (count_in_window, window_start).
 type RateLimiter = Arc<TokioMutex<HashMap<IpAddr, (u32, Instant)>>>;
 
-/// 120 requests per 60-second window per IP (~2 req/s sustained).
+/// 600 requests per 60-second window per IP (~10 req/s sustained).
+/// Localhost (pool backend, Traefik proxy) is exempt from rate limiting.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
-const RATE_MAX_REQ: u32 = 120;
+const RATE_MAX_REQ: u32 = 600;
 
 /// Maximum request body size: 512 KB. Protects expensive POST endpoints.
 const MAX_BODY_BYTES: usize = 512 * 1024;
@@ -237,21 +238,18 @@ fn account_from_blocks(
 
 async fn get_status(State(node): State<TaronNode>) -> Json<StatusResponse> {
     let st = node.status().await;
-    let chain = node.blockchain.read().await;
-    let difficulty = chain.difficulty;
-    let total_tx_count = chain.height();
-    drop(chain);
+    // status() already reads blockchain — reuse its data to avoid double-locking
     Json(StatusResponse {
         chain_height: st.chain_height,
         best_hash: st.best_hash,
-        difficulty,
+        difficulty: st.difficulty,
         peer_count: st.peer_count,
         inbound_peers: st.inbound_count,
         outbound_peers: st.outbound_count,
         mempool_size: st.mempool_size,
         account_count: st.account_count,
         total_supply: st.total_supply,
-        total_tx_count,
+        total_tx_count: st.chain_height,
     })
 }
 
@@ -637,6 +635,11 @@ async fn check_rate_limit(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip())
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+    // Exempt localhost and private networks (pool backend, Traefik proxy)
+    if ip.is_loopback() || matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 10 || v4.octets()[0] == 172 || (v4.octets()[0] == 192 && v4.octets()[1] == 168)) {
+        return next.run(req).await;
+    }
 
     let mut map = limiter.lock().await;
     let now = Instant::now();

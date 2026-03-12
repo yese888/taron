@@ -5,11 +5,11 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::OwnedReadHalf;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use taron_core::{Block, Blockchain, Transaction, Ledger, Wallet, TransactionStatus, TESTNET_DIFFICULTY};
 use tracing::{debug, info, warn};
 
@@ -55,6 +55,7 @@ pub struct NodeStatus {
     pub account_count: usize,
     pub total_supply: u64,
     pub chain_height: u64,
+    pub difficulty: u32,
     /// Hex-encoded hash of the chain tip block.
     pub best_hash: String,
 }
@@ -80,6 +81,21 @@ pub struct TaronNode {
     /// True once initial sync is complete (IBD done or already at tip).
     /// Mining threads should wait for this before starting work.
     pub sync_ready: Arc<AtomicBool>,
+    /// Limits concurrent block processing to 1 task at a time.
+    /// Prevents 17 peers from all queuing for the write lock simultaneously,
+    /// which starves RPC read operations.
+    pub block_semaphore: Arc<Semaphore>,
+    /// Current chain height — updated atomically after each block, used for
+    /// lock-free quick-reject of stale block submissions.
+    pub chain_height: Arc<AtomicU64>,
+    /// Cached difficulty — updated atomically after each block.
+    pub cached_difficulty: Arc<AtomicU64>,
+    /// Cached best hash — updated after each block for lock-free status reads.
+    pub cached_best_hash: Arc<RwLock<String>>,
+    /// Cached account count — updated atomically after each block for lock-free status reads.
+    pub cached_account_count: Arc<AtomicU64>,
+    /// Cached total supply — updated atomically after each block for lock-free status reads.
+    pub cached_total_supply: Arc<AtomicU64>,
 }
 
 impl TaronNode {
@@ -109,6 +125,11 @@ impl TaronNode {
         };
 
         let data_dir = config.data_dir.clone();
+        let initial_height = blockchain.height();
+        let initial_diff = blockchain.difficulty as u64;
+        let initial_hash = hex::encode(blockchain.tip().hash);
+        let initial_accounts = ledger.account_count() as u64;
+        let initial_supply = ledger.total_supply();
         Self {
             config,
             mempool: Arc::new(RwLock::new(Mempool::new())),
@@ -120,6 +141,12 @@ impl TaronNode {
             finality: Arc::new(finality),
             data_dir,
             sync_ready: Arc::new(AtomicBool::new(false)),
+            block_semaphore: Arc::new(Semaphore::new(1)),
+            chain_height: Arc::new(AtomicU64::new(initial_height)),
+            cached_difficulty: Arc::new(AtomicU64::new(initial_diff)),
+            cached_best_hash: Arc::new(RwLock::new(initial_hash)),
+            cached_account_count: Arc::new(AtomicU64::new(initial_accounts)),
+            cached_total_supply: Arc::new(AtomicU64::new(initial_supply)),
         }
     }
 
@@ -134,6 +161,12 @@ impl TaronNode {
             .map(|d| d.join("chain.db"))
             .unwrap_or_else(|| std::env::temp_dir().join(format!("taron_genesis_{}", std::process::id())));
 
+        let blockchain = Blockchain::load_or_create(&chain_path, TESTNET_DIFFICULTY);
+        let initial_height = blockchain.height();
+        let initial_diff = blockchain.difficulty as u64;
+        let initial_hash = hex::encode(blockchain.tip().hash);
+        let initial_accounts = ledger.account_count() as u64;
+        let initial_supply = ledger.total_supply();
         Self {
             config,
             mempool: Arc::new(RwLock::new(Mempool::new())),
@@ -141,41 +174,61 @@ impl TaronNode {
             peer_known_txs: Arc::new(RwLock::new(HashSet::new())),
             discovered_peers: Arc::new(RwLock::new(HashSet::new())),
             ledger: Arc::new(RwLock::new(ledger)),
-            blockchain: Arc::new(RwLock::new(
-                Blockchain::load_or_create(&chain_path, TESTNET_DIFFICULTY)
-            )),
+            blockchain: Arc::new(RwLock::new(blockchain)),
             finality: Arc::new(finality),
             data_dir,
             sync_ready: Arc::new(AtomicBool::new(false)),
+            block_semaphore: Arc::new(Semaphore::new(1)),
+            chain_height: Arc::new(AtomicU64::new(initial_height)),
+            cached_difficulty: Arc::new(AtomicU64::new(initial_diff)),
+            cached_best_hash: Arc::new(RwLock::new(initial_hash)),
+            cached_account_count: Arc::new(AtomicU64::new(initial_accounts)),
+            cached_total_supply: Arc::new(AtomicU64::new(initial_supply)),
         }
     }
 
     /// Save blockchain and ledger to disk (if data_dir is set).
     pub async fn save_state(&self) {
         if let Some(ref dir) = self.data_dir {
-            let chain = self.blockchain.read().await;
-            let ledger = self.ledger.read().await;
-            chain.save(&dir.join("chain.db"));
-            ledger.save(&dir.join("ledger.bin"));
+            // Save chain and ledger with short-lived locks to avoid blocking RPC reads
+            {
+                let chain = self.blockchain.read().await;
+                chain.save(&dir.join("chain.db"));
+            }
+            {
+                let ledger = self.ledger.read().await;
+                ledger.save(&dir.join("ledger.bin"));
+            }
         }
     }
 
     /// Get current node status.
+    /// Each lock is acquired and released individually to avoid holding
+    /// multiple locks simultaneously, which causes cross-runtime deadlocks.
     pub async fn status(&self) -> NodeStatus {
-        let peers = self.peers.lock().await;
-        let mempool = self.mempool.read().await;
-        let ledger = self.ledger.read().await;
-        let blockchain = self.blockchain.read().await;
+        let (peer_count, inbound_count, outbound_count) = {
+            let peers = self.peers.lock().await;
+            (peers.count(), peers.inbound_count(), peers.outbound_count())
+        };
+        let mempool_size = self.mempool.read().await.len();
+        // Use cached atomics — never blocks, always returns valid data
+        let account_count = self.cached_account_count.load(Ordering::Relaxed) as usize;
+        let total_supply = self.cached_total_supply.load(Ordering::Relaxed);
+        // Use cached atomics for blockchain data — never blocks
+        let chain_height = self.chain_height.load(Ordering::Relaxed);
+        let difficulty = self.cached_difficulty.load(Ordering::Relaxed) as u32;
+        let best_hash = self.cached_best_hash.read().await.clone();
         NodeStatus {
             listen_port: self.config.listen_port,
-            peer_count: peers.count(),
-            inbound_count: peers.inbound_count(),
-            outbound_count: peers.outbound_count(),
-            mempool_size: mempool.len(),
-            account_count: ledger.account_count(),
-            total_supply: ledger.total_supply(),
-            chain_height: blockchain.height(),
-            best_hash: hex::encode(blockchain.tip().hash),
+            peer_count,
+            inbound_count,
+            outbound_count,
+            mempool_size,
+            account_count,
+            total_supply,
+            chain_height,
+            difficulty,
+            best_hash,
         }
     }
 
@@ -197,8 +250,14 @@ impl TaronNode {
             let data_dir = self.data_dir.clone();
             let discovered = self.discovered_peers.clone();
             let sync_ready = self.sync_ready.clone();
+            let block_sem = self.block_semaphore.clone();
+            let chain_h = self.chain_height.clone();
+            let cached_ac = self.cached_account_count.clone();
+            let cached_ts = self.cached_total_supply.clone();
+            let cached_diff = self.cached_difficulty.clone();
+            let cached_bh = self.cached_best_hash.clone();
             tokio::spawn(async move {
-                if let Err(e) = connect_to_peer(seed, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered, sync_ready).await {
+                if let Err(e) = connect_to_peer(seed, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered, sync_ready, block_sem, chain_h, cached_ac, cached_ts, cached_diff, cached_bh).await {
                     warn!("Failed to connect to seed {}: {}", seed, e);
                 }
             });
@@ -217,6 +276,12 @@ impl TaronNode {
             let config_seeds = self.config.seed_nodes.clone();
             let discovered = self.discovered_peers.clone();
             let sync_ready = self.sync_ready.clone();
+            let block_sem = self.block_semaphore.clone();
+            let chain_h = self.chain_height.clone();
+            let cached_ac = self.cached_account_count.clone();
+            let cached_ts = self.cached_total_supply.clone();
+            let cached_diff = self.cached_difficulty.clone();
+            let cached_bh = self.cached_best_hash.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -257,8 +322,14 @@ impl TaronNode {
                         let data_dir = data_dir.clone();
                         let discovered = discovered.clone();
                         let sync_ready = sync_ready.clone();
+                        let block_sem = block_sem.clone();
+                        let chain_h = chain_h.clone();
+                        let cached_ac = cached_ac.clone();
+                        let cached_ts = cached_ts.clone();
+                        let cached_diff = cached_diff.clone();
+                        let cached_bh = cached_bh.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = connect_to_peer(candidate, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered, sync_ready).await {
+                            if let Err(e) = connect_to_peer(candidate, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered, sync_ready, block_sem, chain_h, cached_ac, cached_ts, cached_diff, cached_bh).await {
                                 debug!("[P2P] Connect to {} failed: {}", candidate, e);
                             }
                         });
@@ -301,12 +372,19 @@ impl TaronNode {
                 continue;
             }
 
-            info!("Incoming connection from {}", addr);
-
-            {
+            // Register the peer — if add_peer returns false (per-IP limit, duplicate,
+            // or race), drop the connection immediately to prevent FD leaks.
+            let added = {
                 let mut peers = self.peers.lock().await;
-                peers.add_peer(addr, PeerDirection::Inbound);
+                peers.add_peer(addr, PeerDirection::Inbound)
+            };
+            if !added {
+                debug!("Rejecting {}: per-IP limit or duplicate", addr);
+                drop(stream);
+                continue;
             }
+
+            info!("Incoming connection from {}", addr);
 
             let mempool = self.mempool.clone();
             let peers = self.peers.clone();
@@ -318,9 +396,15 @@ impl TaronNode {
             let data_dir = self.data_dir.clone();
             let discovered = self.discovered_peers.clone();
             let sync_ready = self.sync_ready.clone();
+            let block_sem = self.block_semaphore.clone();
+            let chain_h = self.chain_height.clone();
+            let cached_ac = self.cached_account_count.clone();
+            let cached_ts = self.cached_total_supply.clone();
+            let cached_diff = self.cached_difficulty.clone();
+            let cached_bh = self.cached_best_hash.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_peer(stream, addr, port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered, sync_ready).await {
+                if let Err(e) = handle_peer(stream, addr, port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered, sync_ready, block_sem, chain_h, cached_ac, cached_ts, cached_diff, cached_bh).await {
                     debug!("Peer {} disconnected: {}", addr, e);
                 }
                 peers.lock().await.remove_peer(&addr);
@@ -338,12 +422,25 @@ impl TaronNode {
     /// Validate and apply a block submitted externally (e.g. from the pool server),
     /// then broadcast it to peers. Returns true if accepted.
     pub async fn submit_mined_block(&self, block: Block) -> bool {
+        // Lock-free quick-reject: if block height doesn't match, skip entirely
+        let current = self.chain_height.load(Ordering::Relaxed);
+        if block.index != current + 1 {
+            return false;
+        }
+        // No semaphore needed — the write lock provides sufficient serialization.
+        // Using the semaphore here caused "busy" rejections when P2P held it.
         let mut chain = self.blockchain.write().await;
         let mut ledger = self.ledger.write().await;
         match chain.apply_block(&block, &mut ledger) {
             Ok(()) => {
+                self.chain_height.store(block.index, Ordering::Release);
+                self.cached_difficulty.store(chain.difficulty as u64, Ordering::Release);
+                self.cached_account_count.store(ledger.account_count() as u64, Ordering::Release);
+                self.cached_total_supply.store(ledger.total_supply(), Ordering::Release);
+                let hash = hex::encode(&block.hash);
                 drop(chain);
                 drop(ledger);
+                *self.cached_best_hash.write().await = hash;
                 self.save_state().await;
                 // Purge included txs from mempool
                 {
@@ -391,6 +488,12 @@ async fn connect_to_peer(
     data_dir: Option<PathBuf>,
     discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
     sync_ready: Arc<AtomicBool>,
+    block_semaphore: Arc<Semaphore>,
+    chain_height: Arc<AtomicU64>,
+    cached_account_count: Arc<AtomicU64>,
+    cached_total_supply: Arc<AtomicU64>,
+    cached_difficulty: Arc<AtomicU64>,
+    cached_best_hash: Arc<RwLock<String>>,
 ) -> io::Result<()> {
     {
         let mut pm = peers.lock().await;
@@ -434,7 +537,7 @@ async fn connect_to_peer(
     let _ = btx.send(Message::GetTxHashes);
 
     // Handle incoming messages (reads from read_half, sends responses via btx)
-    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready).await;
+    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
 
     writer_handle.abort();
     peers.lock().await.remove_peer(&addr);
@@ -455,6 +558,12 @@ async fn handle_peer(
     data_dir: Option<PathBuf>,
     discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
     sync_ready: Arc<AtomicBool>,
+    block_semaphore: Arc<Semaphore>,
+    chain_height: Arc<AtomicU64>,
+    cached_account_count: Arc<AtomicU64>,
+    cached_total_supply: Arc<AtomicU64>,
+    cached_difficulty: Arc<AtomicU64>,
+    cached_best_hash: Arc<RwLock<String>>,
 ) -> io::Result<()> {
     // Split stream into read/write halves
     let (mut read_half, mut write_half) = stream.into_split();
@@ -485,7 +594,7 @@ async fn handle_peer(
     });
     let _ = btx.send(Message::GetChainHeight);
 
-    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready).await;
+    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
 
     writer_handle.abort();
     result
@@ -511,6 +620,12 @@ async fn handle_messages(
     data_dir: Option<PathBuf>,
     discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
     sync_ready: Arc<AtomicBool>,
+    block_semaphore: Arc<Semaphore>,
+    chain_height_atomic: Arc<AtomicU64>,
+    cached_account_count: Arc<AtomicU64>,
+    cached_total_supply: Arc<AtomicU64>,
+    cached_difficulty: Arc<AtomicU64>,
+    cached_best_hash: Arc<RwLock<String>>,
 ) -> io::Result<()> {
     // Track the peer's reported chain height so IBD can continue chunk by chunk.
     let mut peer_height: Option<u64> = None;
@@ -660,7 +775,51 @@ async fn handle_messages(
                 let block_index = block.index;
                 let block_hash_hex = hex::encode(&block.hash[..8]);
 
-                let result = {
+                // Lock-free pre-check using atomic height
+                let our_height = chain_height_atomic.load(Ordering::Relaxed);
+
+                // Block is ahead of our tip — request sync, don't process yet
+                if block_index > our_height + 1 {
+                    peer_height = Some(block_index);
+                    info!(
+                        "[SYNC] NewBlock #{} from {} is ahead of our height {} — requesting blocks {}..{}",
+                        block_index, addr, our_height, our_height + 1, block_index
+                    );
+                    let from = our_height + 1;
+                    let to = (from + crate::sync::IBD_CHUNK_SIZE - 1).min(block_index);
+                    send_to_peer(out_tx, Message::GetBlocks { from, to })?;
+                    continue;
+                }
+
+                // Block is behind our tip — skip stale blocks silently
+                if block_index < our_height {
+                    continue;
+                }
+
+                // Use semaphore to serialize block processing — only 1 task at a time
+                // can acquire the write lock. Others skip immediately (they'll get the
+                // block from the next sync or broadcast anyway).
+                let permit = block_semaphore.try_acquire();
+                if permit.is_err() {
+                    // Another peer task is already processing a block — skip this one
+                    debug!("[BLOCK] Skipping #{} from {} — another block is being processed", block_index, addr);
+                    continue;
+                }
+                let _permit = permit.unwrap();
+
+                // Re-check with read lock after acquiring semaphore (state may have changed)
+                let (our_height, tip_hash) = {
+                    let chain = blockchain.read().await;
+                    (chain.height(), chain.tip().hash)
+                };
+
+                let result = if block.index == our_height + 1 && block.prev_hash == tip_hash {
+                    let mut chain = blockchain.write().await;
+                    let mut ledger_state = ledger.write().await;
+                    chain.apply_block(&block, &mut *ledger_state)
+                } else if block.index <= our_height {
+                    Err(taron_core::TaronError::InvalidBlock)
+                } else {
                     let mut chain = blockchain.write().await;
                     let mut ledger_state = ledger.write().await;
                     chain.apply_block(&block, &mut *ledger_state)
@@ -668,6 +827,19 @@ async fn handle_messages(
 
                 match result {
                     Ok(()) => {
+                        // Update all cached atomics immediately so other tasks see fresh data
+                        chain_height_atomic.store(block_index, Ordering::Release);
+                        {
+                            let chain = blockchain.read().await;
+                            cached_difficulty.store(chain.difficulty as u64, Ordering::Release);
+                        }
+                        *cached_best_hash.write().await = hex::encode(&block.hash);
+                        {
+                            let ledger_state = ledger.read().await;
+                            cached_account_count.store(ledger_state.account_count() as u64, Ordering::Release);
+                            cached_total_supply.store(ledger_state.total_supply(), Ordering::Release);
+                        }
+
                         info!(
                             "[BLOCK] #{} accepted from {} | hash: {}… | reward: {:.2} TAR",
                             block_index,
@@ -684,12 +856,16 @@ async fn handle_messages(
                             }
                         }
 
-                        // Persist to disk
+                        // Persist to disk (short-lived locks)
                         if let Some(ref dir) = data_dir {
-                            let chain = blockchain.read().await;
-                            let ledger_state = ledger.read().await;
-                            chain.save(&dir.join("chain.db"));
-                            ledger_state.save(&dir.join("ledger.bin"));
+                            {
+                                let chain = blockchain.read().await;
+                                chain.save(&dir.join("chain.db"));
+                            }
+                            {
+                                let ledger_state = ledger.read().await;
+                                ledger_state.save(&dir.join("ledger.bin"));
+                            }
                         }
 
                         // Relay block to other connected peers via persistent connections
@@ -738,6 +914,10 @@ async fn handle_messages(
                                         if let Ok(reverted) = chain.revert_tip(&mut *ledger_state) {
                                             // Apply the better competing block
                                             if chain.apply_block(&block, &mut *ledger_state).is_ok() {
+                                                chain_height_atomic.store(block_index, Ordering::Release);
+                                                cached_difficulty.store(chain.difficulty as u64, Ordering::Release);
+                                                cached_account_count.store(ledger_state.account_count() as u64, Ordering::Release);
+                                                cached_total_supply.store(ledger_state.total_supply(), Ordering::Release);
                                                 info!(
                                                     "[REORG] Tip #{} replaced: {}… → {}… (lower hash wins)",
                                                     block_index,
@@ -746,6 +926,7 @@ async fn handle_messages(
                                                 );
                                                 drop(chain);
                                                 drop(ledger_state);
+                                                *cached_best_hash.write().await = hex::encode(&block.hash);
 
                                                 // Persist
                                                 if let Some(ref dir) = data_dir {
@@ -848,12 +1029,20 @@ async fn handle_messages(
                         let result = {
                             let mut chain = blockchain.write().await;
                             let mut ledger_state = ledger.write().await;
-                            chain.apply_block_ibd(block, &mut *ledger_state)
+                            let r = chain.apply_block_ibd(block, &mut *ledger_state);
+                            if r.is_ok() {
+                                cached_account_count.store(ledger_state.account_count() as u64, Ordering::Release);
+                                cached_total_supply.store(ledger_state.total_supply(), Ordering::Release);
+                                cached_difficulty.store(chain.difficulty as u64, Ordering::Release);
+                            }
+                            r
                         };
                         match result {
                             Ok(()) => {
                                 applied += 1;
                                 last_height = block.index;
+                                chain_height_atomic.store(block.index, Ordering::Release);
+                                *cached_best_hash.write().await = hex::encode(&block.hash);
                                 let hash_prefix = hex::encode(&block.hash[..5]);
                                 info!("[SYNC] Applied block #{} | hash: {}…", block.index, hash_prefix);
                             }
@@ -890,6 +1079,10 @@ async fn handle_messages(
                                                         Ok(()) => {
                                                             applied += 1;
                                                             last_height = new_block.index;
+                                                            chain_height_atomic.store(new_block.index, Ordering::Release);
+                                                            cached_difficulty.store(chain.difficulty as u64, Ordering::Release);
+                                                            cached_account_count.store(ledger_state.account_count() as u64, Ordering::Release);
+                                                            cached_total_supply.store(ledger_state.total_supply(), Ordering::Release);
                                                             info!("[REORG] Applied block #{}", new_block.index);
                                                         }
                                                         Err(e) => {
@@ -919,6 +1112,11 @@ async fn handle_messages(
                         }
                     }
                     if applied > 0 {
+                        // Update cached best hash to the latest block applied
+                        {
+                            let chain = blockchain.read().await;
+                            *cached_best_hash.write().await = hex::encode(&chain.tip().hash);
+                        }
                         info!("[SYNC] Applied {} blocks from {} — height now: {}", applied, addr, last_height);
 
                         // Persist to disk after sync batch

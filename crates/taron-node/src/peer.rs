@@ -14,8 +14,8 @@ pub const MAX_OUTBOUND: usize = 16;
 /// Keep low to avoid P2P task overload that starves the RPC server.
 pub const MAX_INBOUND: usize = 16;
 /// Maximum simultaneous connections from a single IP.
-/// Set to 5 to accommodate home operators running multiple nodes on the same NAT.
-const MAX_CONNECTIONS_PER_IP: u32 = 5;
+/// Set to 2 to limit FD usage while still allowing NAT traversal retries.
+const MAX_CONNECTIONS_PER_IP: u32 = 2;
 /// Score threshold below which a peer IP is banned.
 const SCORE_BAN_THRESHOLD: i32 = -100;
 /// Duration a banned IP remains blocked.

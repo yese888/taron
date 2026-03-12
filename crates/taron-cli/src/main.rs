@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use taron_core::{Wallet, TxBuilder, Ledger, meets_difficulty, TESTNET_DIFFICULTY, TESTNET_REWARD, Block, Blockchain};
+use taron_core::{Wallet, TxBuilder, Ledger, Transaction, meets_difficulty, TESTNET_DIFFICULTY, TESTNET_REWARD, Block, Blockchain};
 use taron_node::TaronNode;
 use taron_node::node::NodeConfig;
 use taron_node::state_file::NodeStateFile;
@@ -637,35 +637,51 @@ async fn main() -> anyhow::Result<()> {
                             }
 
                             let mut nonce = thread_id as u64 * u64::MAX / threads as u64;
+                            // Cache the block template — only refresh every 2s or after finding a block.
+                            // This avoids rt.block_on() + RwLock per hash which kills performance.
+                            let mut cached_index = 0u64;
+                            let mut cached_prev_hash = [0u8; 32];
+                            let mut cached_difficulty = 0u32;
+                            let mut cached_txs: Vec<Transaction> = Vec::new();
+                            let mut last_template_refresh = std::time::Instant::now();
+                            let template_refresh_interval = std::time::Duration::from_secs(2);
+
                             loop {
+                                // Refresh template periodically (not every hash!)
+                                if last_template_refresh.elapsed() >= template_refresh_interval || cached_index == 0 {
+                                    let (ci, cph, cd, ctxs) = rt.block_on(async {
+                                        let bc = node_bc.read().await;
+                                        let tip = bc.tip();
+                                        let mp = node_mempool.read().await;
+                                        let txs = mp.all_txs().into_iter().cloned().collect::<Vec<_>>();
+                                        (tip.index + 1, tip.hash, bc.difficulty, txs)
+                                    });
+                                    cached_index = ci;
+                                    cached_prev_hash = cph;
+                                    cached_difficulty = cd;
+                                    cached_txs = ctxs;
+                                    last_template_refresh = std::time::Instant::now();
+                                }
+
                                 let timestamp = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap()
                                     .as_millis() as u64;
 
-                                // Read tip + pending txs from mempool
-                                let (chain_index, chain_prev_hash, difficulty, pending_txs) = rt.block_on(async {
-                                    let bc = node_bc.read().await;
-                                    let tip = bc.tip();
-                                    let mp = node_mempool.read().await;
-                                    let txs = mp.all_txs().into_iter().cloned().collect::<Vec<_>>();
-                                    (tip.index + 1, tip.hash, bc.difficulty, txs)
-                                });
-
                                 let mut candidate = Block {
-                                    index: chain_index,
-                                    prev_hash: chain_prev_hash,
+                                    index: cached_index,
+                                    prev_hash: cached_prev_hash,
                                     timestamp,
                                     miner: pubkey,
                                     nonce,
                                     hash: [0u8; 32],
                                     reward,
-                                    transactions: pending_txs,
+                                    transactions: cached_txs.clone(),
                                 };
                                 let hash = candidate.hash_header();
                                 total_hashes.fetch_add(1, Ordering::Relaxed);
 
-                                if meets_difficulty(&hash, difficulty) {
+                                if meets_difficulty(&hash, cached_difficulty) {
                                     candidate.hash = hash;
                                     let sol_num = solutions.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -701,6 +717,8 @@ async fn main() -> anyhow::Result<()> {
 
                                     // Send to relay task for disk save + peer broadcast
                                     block_tx.blocking_send(candidate).ok();
+                                    // Force template refresh on next iteration
+                                    last_template_refresh = std::time::Instant::now() - template_refresh_interval;
                                 }
                                 nonce = nonce.wrapping_add(1);
                             }

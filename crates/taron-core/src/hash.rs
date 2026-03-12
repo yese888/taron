@@ -153,8 +153,20 @@ impl Sequal256 {
     /// Sequential dependency is preserved — GPU/ASIC resistance comes from
     /// the chain structure, not scratchpad size alone.
     pub fn hash_fast(seed: &[u8], steps: u32) -> [u8; 32] {
-        let mut scratchpad = vec![0u64; MINING_SCRATCHPAD_U64S];
-        Self::expand_scratchpad(seed, &mut scratchpad);
+        // Reuse thread-local scratchpad to avoid 256KB heap allocation per hash.
+        // This gives ~5-10x speedup in tight mining loops.
+        thread_local! {
+            static SCRATCHPAD: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(vec![0u64; MINING_SCRATCHPAD_U64S]);
+        }
+        SCRATCHPAD.with(|sp| {
+            let mut scratchpad = sp.borrow_mut();
+            Self::hash_fast_with_scratchpad(seed, steps, &mut scratchpad)
+        })
+    }
+
+    /// hash_fast with a caller-provided scratchpad (avoids allocation).
+    fn hash_fast_with_scratchpad(seed: &[u8], steps: u32, scratchpad: &mut [u64]) -> [u8; 32] {
+        Self::expand_scratchpad(seed, scratchpad);
 
         let seed_hash = sha3_256(seed);
         let mut state = [
