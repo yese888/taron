@@ -175,29 +175,34 @@ impl Blockchain {
     /// The block is written to RocksDB atomically before returning.
     pub fn apply_block(&mut self, block: &Block, ledger: &mut Ledger) -> Result<(), TaronError> {
         let prev = self.tip();
-        if !block.is_valid(&prev, self.difficulty) {
+        if let Some(reason) = block.validate_inner(&prev, self.difficulty, true) {
+            eprintln!("[REJECT] block #{}: {}", block.index, reason);
             return Err(TaronError::InvalidBlock);
         }
 
         // CVE-001: enforce canonical reward — miner cannot self-assign arbitrary amounts
         if block.reward != crate::TESTNET_REWARD {
+            eprintln!("[REJECT] block #{}: bad reward {} expected {}", block.index, block.reward, crate::TESTNET_REWARD);
             return Err(TaronError::InvalidBlock);
         }
 
         // Validate all transactions before applying any (atomic).
-        // validate_structure() is intentionally NOT called here — its ±30s timestamp
-        // check would reject legitimate txs that sat in the mempool before confirmation.
-        // Timestamp is only enforced at mempool ingestion (submit_tx). Sequence numbers
-        // prevent replay attacks independently.
-        for tx in &block.transactions {
-            tx.verify_signature().map_err(|_| TaronError::InvalidBlock)?;
+        for (i, tx) in block.transactions.iter().enumerate() {
+            if let Err(e) = tx.verify_signature() {
+                eprintln!("[REJECT] block #{}: tx {} sig fail: {:?}", block.index, i, e);
+                return Err(TaronError::InvalidBlock);
+            }
         }
 
         ledger.apply_coinbase(&block.miner, block.reward);
 
         // Apply transactions
-        for tx in &block.transactions {
-            ledger.apply_tx(tx).map_err(|_| TaronError::InvalidBlock)?;
+        for (i, tx) in block.transactions.iter().enumerate() {
+            if let Err(e) = ledger.apply_tx(tx) {
+                eprintln!("[REJECT] block #{}: tx {} apply fail: {:?} (sender={} amount={})",
+                    block.index, i, e, hex::encode(&tx.sender[..8]), tx.amount);
+                return Err(TaronError::InvalidBlock);
+            }
         }
 
         // Write block to DB

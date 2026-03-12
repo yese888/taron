@@ -49,6 +49,13 @@ pub struct PeerInfo {
     broadcast_tx: Option<UnboundedSender<Message>>,
 }
 
+impl PeerInfo {
+    /// Take the broadcast sender out (for graceful shutdown).
+    pub fn take_broadcast_tx(&mut self) -> Option<UnboundedSender<Message>> {
+        self.broadcast_tx.take()
+    }
+}
+
 /// Manages connected peers: connection limits, per-IP caps, scoring, and banning.
 #[derive(Debug, Default)]
 pub struct PeerManager {
@@ -195,6 +202,11 @@ impl PeerManager {
         if let Some(peer) = self.peers.get_mut(addr) {
             peer.broadcast_tx = Some(tx);
         }
+    }
+
+    /// Mutable access to the peers map (for targeted cleanup).
+    pub fn peers_mut(&mut self) -> &mut HashMap<SocketAddr, PeerInfo> {
+        &mut self.peers
     }
 
     /// Broadcast a message to all connected peers, optionally excluding one.

@@ -99,29 +99,24 @@ impl Block {
     }
 
     fn is_valid_inner(&self, prev_block: &Block, difficulty: u32, check_timestamp: bool) -> bool {
-        // 1. Sequential index
+        self.validate_inner(prev_block, difficulty, check_timestamp).is_none()
+    }
+
+    /// Returns `None` if valid, or `Some(reason)` if invalid.
+    pub fn validate_inner(&self, prev_block: &Block, difficulty: u32, check_timestamp: bool) -> Option<String> {
         if self.index != prev_block.index + 1 {
-            return false;
+            return Some(format!("bad index: got {} expected {}", self.index, prev_block.index + 1));
         }
-
-        // 2. Prev hash linkage
         if self.prev_hash != prev_block.hash {
-            return false;
+            return Some(format!("bad prev_hash: got {} expected {}", hex::encode(&self.prev_hash[..8]), hex::encode(&prev_block.hash[..8])));
         }
-
-        // 3. Hash integrity
         let computed = self.hash_header();
         if self.hash != computed {
-            return false;
+            return Some(format!("bad hash: stored {} computed {}", hex::encode(&self.hash[..8]), hex::encode(&computed[..8])));
         }
-
-        // 4. Difficulty target
         if !meets_difficulty(&self.hash, difficulty) {
-            return false;
+            return Some(format!("insufficient difficulty: hash {} required {}", hex::encode(&self.hash[..8]), difficulty));
         }
-
-        // 5. Timestamp tolerance — prevents DAA manipulation via fake timestamps
-        // Skipped during IBD since historical blocks are always in the past.
         if check_timestamp {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -133,11 +128,10 @@ impl Block {
                 now_ms - self.timestamp
             };
             if delta > BLOCK_TIMESTAMP_TOLERANCE_MS {
-                return false;
+                return Some(format!("timestamp too far: block={} now={} delta={}ms max={}ms", self.timestamp, now_ms, delta, BLOCK_TIMESTAMP_TOLERANCE_MS));
             }
         }
-
-        true
+        None
     }
 }
 

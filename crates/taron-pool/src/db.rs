@@ -8,6 +8,7 @@
 //! defaulting to `postgres://taron_pool:taron_pool@localhost/taron_pool`.
 
 use sqlx::{PgPool, Row};
+use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 
 // ── Records ───────────────────────────────────────────────────────────────────
@@ -46,7 +47,11 @@ pub struct Db {
 impl Db {
     /// Connect to PostgreSQL and run schema migrations.
     pub async fn connect(url: &str) -> Result<Self, sqlx::Error> {
-        let pool = PgPool::connect(url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(30)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(url)
+            .await?;
         Self::migrate(&pool).await?;
         Ok(Self { pool })
     }
@@ -400,6 +405,40 @@ impl Db {
         .fetch_one(&self.pool)
         .await?;
         Ok(count as usize)
+    }
+
+    /// Count distinct workers (miner_address:worker_name pairs) since `since_ms`.
+    pub async fn distinct_workers_since(&self, since_ms: u64) -> Result<usize, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT (miner_address || ':' || worker_name)) FROM shares WHERE timestamp_ms >= $1",
+        )
+        .bind(since_ms as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count as usize)
+    }
+
+    /// Per-worker share counts since `since_ms` for hashrate computation.
+    /// Returns (worker_key, share_count, min_timestamp, max_timestamp).
+    pub async fn worker_share_stats_since(&self, since_ms: u64) -> Result<Vec<(String, i64, i64, i64)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT miner_address || ':' || worker_name AS wkey, \
+                    COUNT(*) AS cnt, \
+                    MIN(timestamp_ms) AS t_min, \
+                    MAX(timestamp_ms) AS t_max \
+             FROM shares WHERE timestamp_ms >= $1 \
+             GROUP BY miner_address, worker_name",
+        )
+        .bind(since_ms as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| {
+            let wkey: String = r.get("wkey");
+            let cnt: i64 = r.get("cnt");
+            let t_min: i64 = r.get("t_min");
+            let t_max: i64 = r.get("t_max");
+            (wkey, cnt, t_min, t_max)
+        }).collect())
     }
 
     /// Sum of `amount_micro` paid to `address` across all payouts.

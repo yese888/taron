@@ -35,7 +35,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
@@ -78,6 +78,21 @@ struct Round {
     total_shares: u64,
 }
 
+/// Cached stats for /pool/status (updated every few seconds in background).
+#[derive(Clone, Default)]
+struct CachedPoolStats {
+    active_miners: usize,
+    active_workers: usize,
+    pool_hashrate: f64,
+    total_paid: u64,
+}
+
+/// A block found by a miner, ready to be submitted to the node.
+struct FoundBlock {
+    candidate: Block,
+    hash: [u8; 32],
+}
+
 struct PoolState {
     wallet: Wallet,
     template: RwLock<BlockTemplate>,
@@ -95,6 +110,10 @@ struct PoolState {
     dedup: RwLock<TachyonGuard>,
     /// PostgreSQL/TimescaleDB persistence (shares, payouts, hashrate snapshots).
     db: Arc<Db>,
+    /// Cached stats for /pool/status (refreshed every 5s by background task).
+    cached_stats: RwLock<CachedPoolStats>,
+    /// Channel to send found blocks to the submitter task.
+    block_tx: mpsc::UnboundedSender<FoundBlock>,
 }
 
 type Pool = Arc<PoolState>;
@@ -296,6 +315,64 @@ async fn build_payout_txs(
     txs
 }
 
+// ── Block submitter task ─────────────────────────────────────────────────────
+
+/// Background task that processes found blocks sequentially.
+/// Only one block per height is submitted; duplicates are skipped.
+async fn block_submitter_task(pool: Pool, mut rx: mpsc::UnboundedReceiver<FoundBlock>) {
+    let client = reqwest::Client::new();
+    let mut last_submitted_index: u64 = 0;
+
+    while let Some(found) = rx.recv().await {
+        let block_index = found.candidate.index;
+
+        // Skip if we already submitted a block at this height
+        if block_index <= last_submitted_index {
+            continue;
+        }
+
+        info!("Submitting block #{} to node...", block_index);
+
+        let round_start = *pool.round_start_ms.read().await;
+
+        // Build payout transactions
+        let mut payout_txs = build_payout_txs(&pool, &client, block_index, round_start).await;
+
+        // Include pending mempool transactions
+        let mempool_txs = fetch_mempool_txs(&client).await;
+        if !mempool_txs.is_empty() {
+            info!("Including {} mempool tx(s) in block #{}", mempool_txs.len(), block_index);
+        }
+        payout_txs.extend(mempool_txs);
+
+        let mut final_block = found.candidate;
+        final_block.hash = found.hash;
+        final_block.transactions = payout_txs;
+
+        let submitted = submit_block_to_node(&client, &final_block).await;
+
+        if submitted {
+            last_submitted_index = block_index;
+            *pool.blocks_found.write().await += 1;
+            info!("Block #{} accepted with {} payout txs", block_index, final_block.transactions.len());
+
+            // Drain remaining entries for this same height (stale)
+            while let Ok(stale) = rx.try_recv() {
+                if stale.candidate.index > block_index {
+                    // This is for the NEXT height — process it
+                    let _ = pool.block_tx.send(FoundBlock {
+                        candidate: stale.candidate,
+                        hash: stale.hash,
+                    });
+                    break;
+                }
+            }
+        } else {
+            warn!("Block #{} rejected by node", block_index);
+        }
+    }
+}
+
 // ── Hashrate snapshot task ────────────────────────────────────────────────────
 
 async fn snapshot_task(pool: Pool, db: Arc<Db>) {
@@ -340,6 +417,7 @@ async fn snapshot_task(pool: Pool, db: Arc<Db>) {
 async fn pool_watcher(pool: Pool) {
     let client = reqwest::Client::new();
     let mut last_height: u64 = 0;
+    let mut last_hash = String::new();
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
@@ -351,7 +429,8 @@ async fn pool_watcher(pool: Pool) {
 
         let pool_pubkey = pool.wallet.public_key();
 
-        if status.chain_height > last_height {
+        // Update template when chain advances OR when best_hash changes (node restart/reorg)
+        if status.chain_height > last_height || status.best_hash != last_hash {
             // New block on chain — update template, check if it was ours
             let new_tmpl = BlockTemplate {
                 index: status.chain_height + 1,
@@ -395,8 +474,52 @@ async fn pool_watcher(pool: Pool) {
             }
 
             last_height = status.chain_height;
+            last_hash = status.best_hash.clone();
             let _ = pool_pubkey;
         }
+    }
+}
+
+// ── Stats cache task ──────────────────────────────────────────────────────────
+
+async fn stats_cache_task(pool: Pool) {
+    loop {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH).unwrap_or_default()
+            .as_millis() as u64;
+        let since_2m = now_ms.saturating_sub(2 * 60 * 1000);
+        let window_ms = 2 * 60 * 1000u64;
+
+        let share_diff = { pool.template.read().await.share_difficulty };
+
+        let (active, workers, worker_stats, total_paid) = tokio::join!(
+            pool.db.distinct_miners_since(since_2m),
+            pool.db.distinct_workers_since(since_2m),
+            pool.db.worker_share_stats_since(since_2m),
+            pool.db.total_paid(),
+        );
+
+        let hashes_per_share = (1u64 << share_diff.min(63)) as f64;
+        let mut pool_hashrate = 0.0f64;
+        for (_wkey, cnt, t_min, t_max) in worker_stats.unwrap_or_default() {
+            let total_hashes = cnt as f64 * hashes_per_share;
+            let span_ms = if cnt >= 2 {
+                let span = (t_max - t_min) as u64;
+                if span > 0 { span } else { window_ms }
+            } else { window_ms };
+            let span_s = span_ms as f64 / 1000.0;
+            if span_s > 0.0 { pool_hashrate += total_hashes / span_s; }
+        }
+
+        let stats = CachedPoolStats {
+            active_miners: active.unwrap_or(0),
+            active_workers: workers.unwrap_or(0),
+            pool_hashrate,
+            total_paid: total_paid.unwrap_or(0),
+        };
+        *pool.cached_stats.write().await = stats;
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }
 
@@ -423,29 +546,12 @@ async fn get_pool_status(State(pool): State<Pool>) -> Json<PoolStatusResponse> {
     let round = pool.round.read().await;
     let blocks_found = *pool.blocks_found.read().await;
 
-    // Count active miners/workers and compute pool hashrate from recent shares (2 min)
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH).unwrap_or_default()
-        .as_millis() as u64;
-    let since_2m = now_ms.saturating_sub(2 * 60 * 1000);
-    let active = pool.db.distinct_miners_since(since_2m).await.unwrap_or(0);
-    let recent_shares = pool.db.shares_since(since_2m).await.unwrap_or_default();
-
-    // Pool hashrate = sum of per-worker hashrates (consistent with miner page)
-    let share_diff = tmpl.share_difficulty;
-    let mut per_worker: std::collections::HashMap<String, Vec<ShareRecord>> = std::collections::HashMap::new();
-    let mut workers_set = std::collections::HashSet::new();
-    for s in &recent_shares {
-        let key = format!("{}:{}", s.miner_address, s.worker_name);
-        workers_set.insert(key.clone());
-        per_worker.entry(key).or_default().push(s.clone());
-    }
-    let mut pool_hashrate = 0.0f64;
-    for (_key, worker_shares) in &per_worker {
-        pool_hashrate += estimate_hashrate(worker_shares, share_diff, 2 * 60 * 1000);
-    }
-
-    let total_paid = pool.db.total_paid().await.unwrap_or(0);
+    // Read pre-computed stats from background cache (instant, no DB calls)
+    let stats = pool.cached_stats.read().await.clone();
+    let active = stats.active_miners;
+    let workers = stats.active_workers;
+    let pool_hashrate = stats.pool_hashrate;
+    let total_paid = stats.total_paid;
 
     Json(PoolStatusResponse {
         pool_address: pool.wallet.address(),
@@ -454,7 +560,7 @@ async fn get_pool_status(State(pool): State<Pool>) -> Json<PoolStatusResponse> {
         difficulty: tmpl.difficulty,
         share_difficulty: tmpl.share_difficulty,
         active_miners: active,
-        active_workers: workers_set.len(),
+        active_workers: workers,
         pool_hashrate,
         total_shares_this_round: round.total_shares,
         blocks_found,
@@ -588,6 +694,18 @@ async fn submit_share(
         }));
     }
 
+    // Reject shares with stale timestamps (would cause block rejection by node)
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH).unwrap_or_default()
+        .as_millis() as u64;
+    let ts_delta = if req.timestamp > now_ms { req.timestamp - now_ms } else { now_ms - req.timestamp };
+    if ts_delta > 90_000 {
+        return (StatusCode::BAD_REQUEST, Json(ShareResponse {
+            accepted: false, is_block: false,
+            message: "Stale timestamp — request fresh work".into(),
+        }));
+    }
+
     // Build candidate block to compute hash
     let prev_hash_bytes = hex::decode(&req.prev_hash).unwrap_or_default();
     let mut prev_hash = [0u8; 32];
@@ -675,33 +793,11 @@ async fn submit_share(
     if is_block {
         info!("BLOCK FOUND by {} — nonce={}", req.miner_address, req.nonce);
 
-        let client = reqwest::Client::new();
-        let round_start = *pool.round_start_ms.read().await;
-
-        // Build payout transactions BEFORE submitting the block.
-        // hash_header() excludes transactions, so embedding them doesn't affect
-        // the PoW validity. The block's coinbase runs first in apply_block, so
-        // the pool wallet has TESTNET_REWARD available for the payout txs.
-        let mut payout_txs = build_payout_txs(&pool, &client, req.block_index, round_start).await;
-
-        // Also include any pending user transactions from the mempool so they
-        // get confirmed. Pool payouts come first (they spend the coinbase reward).
-        let mempool_txs = fetch_mempool_txs(&client).await;
-        if !mempool_txs.is_empty() {
-            info!("Including {} mempool tx(s) in block #{}", mempool_txs.len(), req.block_index);
-        }
-        payout_txs.extend(mempool_txs);
-
-        let mut final_block = candidate.clone();
-        final_block.hash = hash;
-        final_block.transactions = payout_txs;
-
-        let submitted = submit_block_to_node(&client, &final_block).await;
-
-        if submitted {
-            *pool.blocks_found.write().await += 1;
-            info!("Block #{} submitted with {} payout txs", req.block_index, final_block.transactions.len());
-        }
+        // Send to background submitter (non-blocking). It handles payouts + submission.
+        let _ = pool.block_tx.send(FoundBlock {
+            candidate: candidate.clone(),
+            hash,
+        });
 
         return (StatusCode::OK, Json(ShareResponse {
             accepted: true, is_block: true,
@@ -1089,6 +1185,8 @@ async fn main() {
 
     let base_share_diff = diff.saturating_sub(SHARE_DIFF_OFFSET);
 
+    let (block_tx, block_rx) = mpsc::unbounded_channel::<FoundBlock>();
+
     let pool: Pool = Arc::new(PoolState {
         wallet,
         template: RwLock::new(initial_template),
@@ -1099,7 +1197,15 @@ async fn main() {
         vardiff: RwLock::new(VarDiffRegistry::new(base_share_diff)),
         dedup: RwLock::new(TachyonGuard::new()),
         db,
+        cached_stats: RwLock::new(CachedPoolStats::default()),
+        block_tx,
     });
+
+    // Start block submitter (processes found blocks sequentially)
+    {
+        let pool_clone = pool.clone();
+        tokio::spawn(async move { block_submitter_task(pool_clone, block_rx).await });
+    }
 
     // Start background watcher
     {
@@ -1112,6 +1218,12 @@ async fn main() {
         let pool_clone = pool.clone();
         let db_clone = pool.db.clone();
         tokio::spawn(async move { snapshot_task(pool_clone, db_clone).await });
+    }
+
+    // Start cached stats refresher (updates /pool/status data every 5s)
+    {
+        let pool_clone = pool.clone();
+        tokio::spawn(async move { stats_cache_task(pool_clone).await });
     }
 
     let cors = CorsLayer::new()

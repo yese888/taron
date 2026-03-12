@@ -6,10 +6,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
+use tokio::task::JoinHandle;
 use taron_core::{Block, Blockchain, Transaction, Ledger, Wallet, TransactionStatus, TESTNET_DIFFICULTY};
 use tracing::{debug, info, warn};
 
@@ -237,8 +239,32 @@ impl TaronNode {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.listen_port)).await?;
         info!("TARON node listening on port {}", self.config.listen_port);
 
+        // Detect our own IPs to prevent self-connections
+        let own_ips: HashSet<std::net::IpAddr> = {
+            let mut ips = HashSet::new();
+            ips.insert(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+            ips.insert(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+            // Detect external IPs by checking what the seed addresses resolve to
+            if let Ok(output) = std::process::Command::new("hostname").arg("-I").output() {
+                if let Ok(s) = std::str::from_utf8(&output.stdout) {
+                    for part in s.split_whitespace() {
+                        if let Ok(ip) = part.parse::<std::net::IpAddr>() {
+                            ips.insert(ip);
+                        }
+                    }
+                }
+            }
+            ips
+        };
+        let own_ips = Arc::new(own_ips);
+        let listen_port = self.config.listen_port;
+
         // Connect to seed nodes — config seeds take priority; fall back to TESTNET_SEEDS.
-        let seeds = resolve_seeds(&self.config.seed_nodes);
+        // Filter out self-connections (server connecting to itself via seed DNS).
+        let seeds: Vec<_> = resolve_seeds(&self.config.seed_nodes)
+            .into_iter()
+            .filter(|a| !(own_ips.contains(&a.ip()) && a.port() == listen_port))
+            .collect();
         for seed in seeds {
             let mempool = self.mempool.clone();
             let peers = self.peers.clone();
@@ -282,6 +308,7 @@ impl TaronNode {
             let cached_ts = self.cached_total_supply.clone();
             let cached_diff = self.cached_difficulty.clone();
             let cached_bh = self.cached_best_hash.clone();
+            let own_ips2 = own_ips.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -302,10 +329,13 @@ impl TaronNode {
                         candidates.extend(disc.drain());
                     }
 
-                    // Filter already-connected
+                    // Filter already-connected AND self-connections
                     let connected = peers.lock().await.all_addrs();
                     let connected_ips: HashSet<_> = connected.iter().map(|a| a.ip()).collect();
-                    candidates.retain(|a| !connected_ips.contains(&a.ip()));
+                    candidates.retain(|a| {
+                        !connected_ips.contains(&a.ip())
+                            && !(own_ips2.contains(&a.ip()) && a.port() == port)
+                    });
 
                     if !candidates.is_empty() {
                         info!("[P2P] {} outbound peers — trying {} candidates", outbound, candidates.len());
@@ -333,6 +363,36 @@ impl TaronNode {
                                 debug!("[P2P] Connect to {} failed: {}", candidate, e);
                             }
                         });
+                    }
+                }
+            });
+        }
+
+        // Stale peer reaper: disconnect peers with no activity for 5 minutes
+        {
+            let peers = self.peers.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                    let stale_addrs: Vec<SocketAddr> = {
+                        let pm = peers.lock().await;
+                        pm.all_peers()
+                            .iter()
+                            .filter(|p| p.last_seen.elapsed() > std::time::Duration::from_secs(300))
+                            .map(|p| p.addr)
+                            .collect()
+                    };
+                    if !stale_addrs.is_empty() {
+                        info!("[P2P] Reaping {} stale peers (no activity for 5min)", stale_addrs.len());
+                        let mut pm = peers.lock().await;
+                        for addr in &stale_addrs {
+                            // Drop the broadcast sender — this makes the writer task exit,
+                            // and the reader will get an error on the next recv, triggering cleanup.
+                            if let Some(peer) = pm.peers_mut().get_mut(addr) {
+                                peer.take_broadcast_tx();
+                            }
+                            pm.remove_peer(addr);
+                        }
                     }
                 }
             });
@@ -475,6 +535,33 @@ impl TaronNode {
     }
 }
 
+/// Properly shut down a peer writer task: wait up to 5s, then abort to free the FD.
+/// Dropping a JoinHandle does NOT cancel the task — it detaches it and the socket leaks.
+/// We must explicitly abort() to ensure write_half is dropped.
+async fn shutdown_writer(handle: JoinHandle<()>, addr: SocketAddr) {
+    // Get abort handle BEFORE consuming JoinHandle with timeout
+    let abort = handle.abort_handle();
+    match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+        Ok(_) => {} // writer exited cleanly
+        Err(_) => {
+            debug!("[P2P] Writer to {} stuck — aborting task to free FD", addr);
+            abort.abort(); // forcefully cancel — drops write_half, closes socket
+        }
+    }
+}
+
+/// Set TCP keepalive on a stream so the OS detects dead connections automatically.
+/// This prevents half-open connections from leaking FDs forever.
+fn set_tcp_keepalive(stream: &TcpStream) {
+    let sock_ref = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(30))
+        .with_interval(std::time::Duration::from_secs(10));
+    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+        debug!("[P2P] Failed to set TCP keepalive: {}", e);
+    }
+}
+
 /// Connect to a peer as outbound.
 async fn connect_to_peer(
     addr: SocketAddr,
@@ -503,6 +590,19 @@ async fn connect_to_peer(
     }
 
     let stream = TcpStream::connect(addr).await?;
+
+    // Self-connection detection: if we connected to our own listen port, bail
+    if stream.local_addr().ok().map(|a| a.ip()) == stream.peer_addr().ok().map(|a| a.ip())
+        && addr.port() == our_port
+    {
+        debug!("[P2P] Self-connection detected to {} — disconnecting", addr);
+        peers.lock().await.remove_peer(&addr);
+        return Ok(());
+    }
+
+    // Set TCP keepalive so OS detects dead connections (30s idle, 10s interval)
+    set_tcp_keepalive(&stream);
+
     info!("Connected to peer {}", addr);
 
     // Split stream into read/write halves for concurrent access
@@ -539,8 +639,11 @@ async fn connect_to_peer(
     // Handle incoming messages (reads from read_half, sends responses via btx)
     let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
 
-    writer_handle.abort();
-    peers.lock().await.remove_peer(&addr);
+    // Gracefully shut down the writer task: drop ALL senders so brx.recv() returns None,
+    // then abort if stuck — prevents CLOSE-WAIT FD leak.
+    peers.lock().await.remove_peer(&addr); // drops the cloned sender in PeerManager
+    drop(btx); // drops the local sender — now all senders are gone
+    shutdown_writer(writer_handle, addr).await;
     result
 }
 
@@ -565,6 +668,9 @@ async fn handle_peer(
     cached_difficulty: Arc<AtomicU64>,
     cached_best_hash: Arc<RwLock<String>>,
 ) -> io::Result<()> {
+    // Set TCP keepalive so OS detects dead connections (30s idle, 10s interval)
+    set_tcp_keepalive(&stream);
+
     // Split stream into read/write halves
     let (mut read_half, mut write_half) = stream.into_split();
 
@@ -594,9 +700,18 @@ async fn handle_peer(
     });
     let _ = btx.send(Message::GetChainHeight);
 
+    let peers_cleanup = peers.clone();
     let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
 
-    writer_handle.abort();
+    // Gracefully shut down the writer task, then abort if stuck — prevents FD leak.
+    {
+        let mut pm = peers_cleanup.lock().await;
+        if let Some(peer) = pm.peers_mut().get_mut(&addr) {
+            peer.take_broadcast_tx(); // drop the cloned sender
+        }
+    }
+    drop(btx); // drop the local sender — all senders gone, writer exits
+    shutdown_writer(writer_handle, addr).await;
     result
 }
 
@@ -629,17 +744,37 @@ async fn handle_messages(
 ) -> io::Result<()> {
     // Track the peer's reported chain height so IBD can continue chunk by chunk.
     let mut peer_height: Option<u64> = None;
+    let mut last_recv = Instant::now();
+    let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(45));
+    ping_interval.tick().await; // first tick is immediate, skip it
 
     loop {
-        // Timeout idle peers after 120s to free resources
-        let msg = match tokio::time::timeout(
-            tokio::time::Duration::from_secs(120),
-            protocol::recv_message(reader),
-        ).await {
-            Ok(result) => result?,
-            Err(_) => {
-                debug!("[P2P] Peer {} idle for 120s — disconnecting", addr);
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "peer idle timeout"));
+        // Use select! to interleave message reading with periodic pings.
+        // This keeps connections alive and detects dead peers faster.
+        let msg = tokio::select! {
+            result = protocol::recv_message(reader) => {
+                match result {
+                    Ok(m) => {
+                        last_recv = Instant::now();
+                        m
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            _ = ping_interval.tick() => {
+                // Check if peer is idle too long (no messages received)
+                if last_recv.elapsed() > std::time::Duration::from_secs(120) {
+                    debug!("[P2P] Peer {} idle for 120s — disconnecting", addr);
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "peer idle timeout"));
+                }
+                // Send keepalive ping
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+                    .as_nanos() as u64;
+                if send_to_peer(out_tx, Message::Ping { nonce }).is_err() {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "ping send failed"));
+                }
+                continue;
             }
         };
 
