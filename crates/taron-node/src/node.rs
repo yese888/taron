@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::OwnedReadHalf;
@@ -76,6 +77,9 @@ pub struct TaronNode {
     pub finality: Arc<NodeFinalityManager>,
     /// Data directory for persistence.
     data_dir: Option<PathBuf>,
+    /// True once initial sync is complete (IBD done or already at tip).
+    /// Mining threads should wait for this before starting work.
+    pub sync_ready: Arc<AtomicBool>,
 }
 
 impl TaronNode {
@@ -115,6 +119,7 @@ impl TaronNode {
             blockchain: Arc::new(RwLock::new(blockchain)),
             finality: Arc::new(finality),
             data_dir,
+            sync_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -141,6 +146,7 @@ impl TaronNode {
             )),
             finality: Arc::new(finality),
             data_dir,
+            sync_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -190,8 +196,9 @@ impl TaronNode {
             let port = self.config.listen_port;
             let data_dir = self.data_dir.clone();
             let discovered = self.discovered_peers.clone();
+            let sync_ready = self.sync_ready.clone();
             tokio::spawn(async move {
-                if let Err(e) = connect_to_peer(seed, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered).await {
+                if let Err(e) = connect_to_peer(seed, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered, sync_ready).await {
                     warn!("Failed to connect to seed {}: {}", seed, e);
                 }
             });
@@ -209,6 +216,7 @@ impl TaronNode {
             let port = self.config.listen_port;
             let config_seeds = self.config.seed_nodes.clone();
             let discovered = self.discovered_peers.clone();
+            let sync_ready = self.sync_ready.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -248,8 +256,9 @@ impl TaronNode {
                         let finality = finality.clone();
                         let data_dir = data_dir.clone();
                         let discovered = discovered.clone();
+                        let sync_ready = sync_ready.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = connect_to_peer(candidate, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered).await {
+                            if let Err(e) = connect_to_peer(candidate, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered, sync_ready).await {
                                 debug!("[P2P] Connect to {} failed: {}", candidate, e);
                             }
                         });
@@ -298,9 +307,10 @@ impl TaronNode {
             let port = self.config.listen_port;
             let data_dir = self.data_dir.clone();
             let discovered = self.discovered_peers.clone();
+            let sync_ready = self.sync_ready.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_peer(stream, addr, port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered).await {
+                if let Err(e) = handle_peer(stream, addr, port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered, sync_ready).await {
                     debug!("Peer {} disconnected: {}", addr, e);
                 }
                 peers.lock().await.remove_peer(&addr);
@@ -370,6 +380,7 @@ async fn connect_to_peer(
     finality: Arc<NodeFinalityManager>,
     data_dir: Option<PathBuf>,
     discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
+    sync_ready: Arc<AtomicBool>,
 ) -> io::Result<()> {
     {
         let mut pm = peers.lock().await;
@@ -413,7 +424,7 @@ async fn connect_to_peer(
     let _ = btx.send(Message::GetTxHashes);
 
     // Handle incoming messages (reads from read_half, sends responses via btx)
-    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers).await;
+    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready).await;
 
     writer_handle.abort();
     peers.lock().await.remove_peer(&addr);
@@ -433,6 +444,7 @@ async fn handle_peer(
     finality: Arc<NodeFinalityManager>,
     data_dir: Option<PathBuf>,
     discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
+    sync_ready: Arc<AtomicBool>,
 ) -> io::Result<()> {
     // Split stream into read/write halves
     let (mut read_half, mut write_half) = stream.into_split();
@@ -463,7 +475,7 @@ async fn handle_peer(
     });
     let _ = btx.send(Message::GetChainHeight);
 
-    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers).await;
+    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready).await;
 
     writer_handle.abort();
     result
@@ -488,6 +500,7 @@ async fn handle_messages(
     finality: Arc<NodeFinalityManager>,
     data_dir: Option<PathBuf>,
     discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
+    sync_ready: Arc<AtomicBool>,
 ) -> io::Result<()> {
     // Track the peer's reported chain height so IBD can continue chunk by chunk.
     let mut peer_height: Option<u64> = None;
@@ -790,6 +803,10 @@ async fn handle_messages(
                     send_to_peer(out_tx, Message::GetBlocks { from, to })?;
                 } else {
                     info!("[SYNC] Peer {} height {} — already in sync (height {})", addr, peer_h, our_h);
+                    if !sync_ready.load(Ordering::Relaxed) {
+                        sync_ready.store(true, Ordering::Release);
+                        info!("[SYNC] Sync ready — mining can start");
+                    }
                 }
             }
 
@@ -804,6 +821,10 @@ async fn handle_messages(
                 if blocks.is_empty() {
                     let h = blockchain.read().await.height();
                     info!("[SYNC] Sync complete — height: {}", h);
+                    if !sync_ready.load(Ordering::Relaxed) {
+                        sync_ready.store(true, Ordering::Release);
+                        info!("[SYNC] Sync ready — mining can start");
+                    }
                 } else {
                     let mut applied = 0usize;
                     let mut last_height = 0u64;
@@ -904,6 +925,10 @@ async fn handle_messages(
                                 send_to_peer(out_tx, Message::GetBlocks { from, to })?;
                             } else {
                                 info!("[SYNC] IBD complete — height: {}", our_h);
+                                if !sync_ready.load(Ordering::Relaxed) {
+                                    sync_ready.store(true, Ordering::Release);
+                                    info!("[SYNC] Sync ready — mining can start");
+                                }
                             }
                         }
                     }

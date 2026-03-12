@@ -598,7 +598,10 @@ async fn main() -> anyhow::Result<()> {
                     let initial_difficulty = TESTNET_DIFFICULTY;
                     println!(" [MINER] Starting {} mining threads...", threads);
                     println!(" [MINER] Address: {}", wallet.address());
-                    println!(" [MINER] Difficulty: {} bits\n", initial_difficulty);
+                    println!(" [MINER] Difficulty: {} bits", initial_difficulty);
+                    println!(" [MINER] Waiting for initial sync before mining...\n");
+
+                    let sync_ready = node.sync_ready.clone();
 
                     for thread_id in 0..threads {
                         let node_bc = node_bc.clone();
@@ -608,8 +611,31 @@ async fn main() -> anyhow::Result<()> {
                         let solutions = solutions.clone();
                         let total_hashes = total_hashes.clone();
                         let block_tx = block_tx.clone();
+                        let sync_ready = sync_ready.clone();
 
                         std::thread::spawn(move || {
+                            // Wait for initial sync to complete before mining.
+                            // This prevents mining on a stale tip (e.g. genesis) while IBD
+                            // hasn't started yet, which would cause an immediate fork.
+                            // Timeout after 30s for solo miners with no peers.
+                            {
+                                use std::sync::atomic::Ordering;
+                                let wait_start = std::time::Instant::now();
+                                let timeout = std::time::Duration::from_secs(30);
+                                while !sync_ready.load(Ordering::Acquire) {
+                                    if wait_start.elapsed() >= timeout {
+                                        if thread_id == 0 {
+                                            eprintln!(" [MINER] No peers found after 30s — starting mining (solo mode)");
+                                        }
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                }
+                                if thread_id == 0 && sync_ready.load(Ordering::Acquire) {
+                                    eprintln!(" [MINER] Sync complete — starting mining");
+                                }
+                            }
+
                             let mut nonce = thread_id as u64 * u64::MAX / threads as u64;
                             loop {
                                 let timestamp = SystemTime::now()
