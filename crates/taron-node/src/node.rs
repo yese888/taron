@@ -832,10 +832,17 @@ async fn handle_messages(
                                 }
                                 let fork_point = chain.find_fork_point(&blocks);
                                 if let Some(fp) = fork_point {
-                                    if fp < chain.height() && chain.height() - fp <= 10 {
+                                    // Allow deeper reorg when incoming chain is much longer (IBD case)
+                                    let reorg_depth = chain.height() - fp;
+                                    let max_reorg = if incoming_max > chain.height() + 5 {
+                                        chain.height() // full revert allowed during IBD
+                                    } else {
+                                        10 // normal reorg limit for competing chains
+                                    };
+                                    if fp < chain.height() && reorg_depth <= max_reorg {
                                         info!(
                                             "[REORG] Fork detected at height {} (our tip: {}) — reverting {} blocks",
-                                            fp, chain.height(), chain.height() - fp
+                                            fp, chain.height(), reorg_depth
                                         );
                                         let mut ledger_state = ledger.write().await;
                                         match chain.revert_to_height(fp, &mut *ledger_state) {
