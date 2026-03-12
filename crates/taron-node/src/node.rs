@@ -277,10 +277,18 @@ impl TaronNode {
             });
         }
 
-        // Accept incoming connections
+        // Accept incoming connections (rate-limited: max 5/sec to prevent flood)
+        let mut last_accept = tokio::time::Instant::now();
+        let min_interval = tokio::time::Duration::from_millis(200); // 5 conn/sec max
         loop {
             let (stream, addr) = listener.accept().await?;
-            info!("Incoming connection from {}", addr);
+
+            // Throttle: ensure at least 200ms between accepted connections
+            let elapsed = last_accept.elapsed();
+            if elapsed < min_interval {
+                tokio::time::sleep(min_interval - elapsed).await;
+            }
+            last_accept = tokio::time::Instant::now();
 
             let can_accept = {
                 let mut peers = self.peers.lock().await;
@@ -292,6 +300,8 @@ impl TaronNode {
                 drop(stream);
                 continue;
             }
+
+            info!("Incoming connection from {}", addr);
 
             {
                 let mut peers = self.peers.lock().await;
@@ -506,7 +516,17 @@ async fn handle_messages(
     let mut peer_height: Option<u64> = None;
 
     loop {
-        let msg = protocol::recv_message(reader).await?;
+        // Timeout idle peers after 120s to free resources
+        let msg = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(120),
+            protocol::recv_message(reader),
+        ).await {
+            Ok(result) => result?,
+            Err(_) => {
+                debug!("[P2P] Peer {} idle for 120s — disconnecting", addr);
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "peer idle timeout"));
+            }
+        };
 
         match msg {
             Message::Hello { version, user_agent, .. } => {
