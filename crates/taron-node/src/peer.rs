@@ -11,7 +11,8 @@ use crate::protocol::Message;
 /// Maximum outbound connections.
 pub const MAX_OUTBOUND: usize = 16;
 /// Maximum inbound connections.
-pub const MAX_INBOUND: usize = 32;
+/// Keep low to avoid P2P task overload that starves the RPC server.
+pub const MAX_INBOUND: usize = 16;
 /// Maximum simultaneous connections from a single IP.
 /// Set to 5 to accommodate home operators running multiple nodes on the same NAT.
 const MAX_CONNECTIONS_PER_IP: u32 = 5;

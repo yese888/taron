@@ -790,15 +790,24 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
 
-                // Start HTTP REST API if --rpc-port is specified
+                // Start HTTP REST API on a DEDICATED runtime so P2P load
+                // can never starve the RPC server.
                 if let Some(rpc_port) = rpc_port {
                     let rpc_node = node.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = taron_node::rpc::start_rpc(rpc_node, rpc_port).await {
-                            eprintln!(" [RPC] Failed to start RPC server: {}", e);
-                        }
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(2)
+                            .enable_all()
+                            .thread_name("rpc-worker")
+                            .build()
+                            .expect("Failed to build RPC runtime");
+                        rt.block_on(async move {
+                            if let Err(e) = taron_node::rpc::start_rpc(rpc_node, rpc_port).await {
+                                eprintln!(" [RPC] Failed to start RPC server: {}", e);
+                            }
+                        });
                     });
-                    println!(" [RPC] REST API enabled on port {}", rpc_port);
+                    println!(" [RPC] REST API enabled on port {} (dedicated runtime)", rpc_port);
                 }
 
                 node.run().await?;
