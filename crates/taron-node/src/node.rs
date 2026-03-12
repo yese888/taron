@@ -769,16 +769,10 @@ async fn handle_messages(
                                 "[BLOCK] #{} rejected from {} ({})",
                                 block_index, addr, e
                             );
-                            // Only penalize for truly old/invalid blocks, not competing ones
-                            if block_index < our_h {
-                                let banned = peers.lock().await
-                                    .penalize(&addr, crate::peer::PENALTY_INVALID_BLOCK);
-                                if banned {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::Other, "peer banned"
-                                    ));
-                                }
-                            }
+                            // Don't penalize for rejected NewBlock — the peer may be on
+                            // a stale fork (common during IBD or after restart). Penalizing
+                            // causes immediate ban (3 blocks × 40 = -120 > -100 threshold)
+                            // which disconnects the peer before IBD can start.
                         }
                     }
                 }
