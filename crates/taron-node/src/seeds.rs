@@ -8,8 +8,9 @@ use std::net::{SocketAddr, ToSocketAddrs};
 /// Known TARON testnet seed nodes (hostname:port or ip:port).
 /// Multiple seeds improve resilience — if one is down, others bootstrap the node.
 pub const TESTNET_SEEDS: &[&str] = &[
-    "seed.taron.network:8333",
-    "seed2.taron.network:8333",
+    "185.211.6.168:8333",  // EU (Contabo)
+    "82.197.67.49:8333",   // US East (Contabo)
+    "46.250.234.67:8333",  // Singapore (Contabo)
 ];
 
 /// Resolve the effective seed-node list.
