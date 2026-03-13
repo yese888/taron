@@ -19,6 +19,10 @@ const MAX_CONNECTIONS_PER_IP: u32 = 2;
 const SCORE_BAN_THRESHOLD: i32 = -100;
 /// Duration a banned IP remains blocked.
 const BAN_DURATION: Duration = Duration::from_secs(3_600); // 1 hour
+/// Maximum new connection attempts from a single IP per minute.
+const MAX_CONN_RATE_PER_MINUTE: usize = 10;
+/// Time window for connection rate tracking.
+const RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Behavior penalty values.
 pub const PENALTY_INVALID_BLOCK: i32 = 40;
@@ -63,6 +67,8 @@ pub struct PeerManager {
     connections_per_ip: HashMap<IpAddr, u32>,
     /// Banned IPs and the instant they were banned.
     banned: HashMap<IpAddr, Instant>,
+    /// Connection attempt timestamps per IP (for rate limiting).
+    connection_attempts: HashMap<IpAddr, Vec<Instant>>,
 }
 
 impl PeerManager {
@@ -71,6 +77,7 @@ impl PeerManager {
             peers: HashMap::new(),
             connections_per_ip: HashMap::new(),
             banned: HashMap::new(),
+            connection_attempts: HashMap::new(),
         }
     }
 
@@ -83,6 +90,22 @@ impl PeerManager {
             self.banned.remove(&ip);
         }
         false
+    }
+
+    /// Track a new connection attempt from an IP.
+    /// Returns false if the IP exceeds MAX_CONN_RATE_PER_MINUTE — caller should
+    /// drop the connection. The IP is auto-banned for 1 hour on rate limit violation.
+    pub fn track_connection_attempt(&mut self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let attempts = self.connection_attempts.entry(ip).or_default();
+        attempts.retain(|t| now.duration_since(*t) < RATE_WINDOW);
+        attempts.push(now);
+        if attempts.len() > MAX_CONN_RATE_PER_MINUTE {
+            warn!("[P2P] Rate limit exceeded from {} ({} attempts/min) — banning 1h", ip, attempts.len());
+            self.banned.insert(ip, Instant::now());
+            return false;
+        }
+        true
     }
 
     /// Apply a behavior penalty to a peer.

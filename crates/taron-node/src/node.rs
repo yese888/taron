@@ -408,26 +408,19 @@ impl TaronNode {
             });
         }
 
-        // Accept incoming connections (rate-limited: max 5/sec to prevent flood)
-        let mut last_accept = tokio::time::Instant::now();
-        let min_interval = tokio::time::Duration::from_millis(200); // 5 conn/sec max
+        // Accept incoming connections — per-IP rate limiting (10/min → ban 1h)
         loop {
             let (stream, addr) = listener.accept().await?;
 
-            // Throttle: ensure at least 200ms between accepted connections
-            let elapsed = last_accept.elapsed();
-            if elapsed < min_interval {
-                tokio::time::sleep(min_interval - elapsed).await;
-            }
-            last_accept = tokio::time::Instant::now();
-
             let can_accept = {
                 let mut peers = self.peers.lock().await;
-                !peers.is_banned(addr.ip()) && peers.can_accept(PeerDirection::Inbound)
+                !peers.is_banned(addr.ip())
+                    && peers.track_connection_attempt(addr.ip())
+                    && peers.can_accept(PeerDirection::Inbound)
             };
 
             if !can_accept {
-                debug!("Rejecting {}: inbound limit reached or IP banned", addr);
+                debug!("Rejecting {}: banned, rate limited, or inbound limit reached", addr);
                 drop(stream);
                 continue;
             }
