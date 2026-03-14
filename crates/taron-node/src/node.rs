@@ -1230,9 +1230,8 @@ async fn handle_messages(
                                     }
                                 } else {
                                     // No common ancestor in this batch — fork is deeper than IBD chunk.
-                                    // If peer chain is significantly longer, revert to genesis and resync
-                                    // so we can converge on the canonical chain.
-                                    if incoming_max > chain.height() + 10 {
+                                    // Only revert to genesis during early IBD, not once established.
+                                    if incoming_max > chain.height() + 10 && chain.height() < 200 {
                                         warn!(
                                             "[SYNC] No common ancestor — peer chain {} vs our height {}. Reverting to genesis for full resync.",
                                             incoming_max, chain.height()
