@@ -1237,7 +1237,7 @@ async fn handle_messages(
                                     // Never revert when close to the tip — just reject the batch.
                                     let peer_announced = peer_height.unwrap_or(incoming_max);
                                     if incoming_max > chain.height() + 10
-                                        && (chain.height() < 200 || peer_announced > chain.height() + 1000) {
+                                        && (chain.height() < 200 || peer_announced > chain.height() + 300) {
                                         warn!(
                                             "[SYNC] No common ancestor — peer chain {} vs our height {}. Reverting to genesis for full resync.",
                                             incoming_max, chain.height()
