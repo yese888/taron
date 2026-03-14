@@ -1191,7 +1191,7 @@ async fn handle_messages(
                                     } else {
                                         10 // normal reorg limit for competing chains
                                     };
-                                    if fp < chain.height() && reorg_depth <= max_reorg {
+                                    if reorg_depth <= max_reorg {
                                         info!(
                                             "[REORG] Fork detected at height {} (our tip: {}) — reverting {} blocks",
                                             fp, chain.height(), reorg_depth
@@ -1240,6 +1240,8 @@ async fn handle_messages(
                                         let mut ledger_state = ledger.write().await;
                                         match chain.revert_to_height(0, &mut *ledger_state) {
                                             Ok(reverted) => {
+                                                // Reset difficulty to initial after full revert to genesis
+                                                chain.difficulty = TESTNET_DIFFICULTY;
                                                 chain_height_atomic.store(0, Ordering::Release);
                                                 cached_difficulty.store(chain.difficulty as u64, Ordering::Release);
                                                 cached_account_count.store(ledger_state.account_count() as u64, Ordering::Release);

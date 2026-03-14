@@ -153,6 +153,13 @@ impl Blockchain {
             let block = self.revert_tip(ledger)?;
             reverted.push(block);
         }
+        // If we reverted all the way to genesis, force difficulty back to
+        // TESTNET_DIFFICULTY and persist it — DB may still hold the old
+        // DAA-adjusted value from the previous chain.
+        if self.height == 0 {
+            self.difficulty = crate::TESTNET_DIFFICULTY;
+            let _ = self.db.put(KEY_DIFF, &self.difficulty.to_le_bytes());
+        }
         Ok(reverted)
     }
 
@@ -286,7 +293,13 @@ impl Blockchain {
         if let Ok(Some(h_bytes)) = db.get(KEY_HEIGHT) {
             let h_arr: [u8; 8] = (&h_bytes[..]).try_into().unwrap_or([0u8; 8]);
             let height = u64::from_le_bytes(h_arr);
-            let diff = if let Ok(Some(d_bytes)) = db.get(KEY_DIFF) {
+            // If chain is at genesis (height 0), always reset difficulty to
+            // TESTNET_DIFFICULTY — the DB may still hold a stale high value
+            // from the previous chain (e.g. after a revert-to-genesis).
+            let diff = if height == 0 {
+                let _ = db.put(KEY_DIFF, &crate::TESTNET_DIFFICULTY.to_le_bytes());
+                crate::TESTNET_DIFFICULTY
+            } else if let Ok(Some(d_bytes)) = db.get(KEY_DIFF) {
                 let d_arr: [u8; 4] = (&d_bytes[..]).try_into().unwrap_or([0u8; 4]);
                 u32::from_le_bytes(d_arr)
             } else { difficulty };
@@ -333,6 +346,9 @@ impl Blockchain {
     // ── Private helpers ──────────────────────────────────────────────────────
 
     fn compute_next_difficulty(&self) -> u32 {
+        if self.height < DAA_WINDOW {
+            return crate::TESTNET_DIFFICULTY;
+        }
         let window_end   = self.block_at(self.height).unwrap();
         let window_start = self.block_at(self.height - DAA_WINDOW).unwrap();
 
