@@ -642,6 +642,13 @@ async fn connect_to_peer(
     // Handle incoming messages (reads from read_half, sends responses via btx)
     let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, ibd_peer, chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
 
+    // Release IBD slot if this peer was driving IBD
+    {
+        let mut slot = ibd_peer.lock().await;
+        if *slot == Some(addr) {
+            *slot = None;
+        }
+    }
     // Gracefully shut down the writer task: drop ALL senders so brx.recv() returns None,
     // then abort if stuck — prevents CLOSE-WAIT FD leak.
     peers.lock().await.remove_peer(&addr); // drops the cloned sender in PeerManager
@@ -705,8 +712,15 @@ async fn handle_peer(
     let _ = btx.send(Message::GetChainHeight);
 
     let peers_cleanup = peers.clone();
-    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, ibd_peer, chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
+    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, ibd_peer.clone(), chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
 
+    // Release IBD slot if this peer was driving IBD
+    {
+        let mut slot = ibd_peer.lock().await;
+        if *slot == Some(addr) {
+            *slot = None;
+        }
+    }
     // Gracefully shut down the writer task, then abort if stuck — prevents FD leak.
     {
         let mut pm = peers_cleanup.lock().await;
