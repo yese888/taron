@@ -169,6 +169,16 @@ impl Blockchain {
     /// Returns the list of reverted blocks (newest first) on success.
     /// Used for deep reorgs when a longer competing chain is discovered.
     pub fn revert_to_height(&mut self, target_height: u64, ledger: &mut Ledger) -> Result<Vec<Block>, TaronError> {
+        // Never revert below a checkpoint we have already passed.
+        let min_safe = CHECKPOINTS.iter()
+            .filter(|&&(h, _)| h <= self.height)
+            .map(|&(h, _)| h)
+            .max()
+            .unwrap_or(0);
+        if target_height < min_safe {
+            eprintln!("[REORG] Refused: target {} is below checkpoint {}", target_height, min_safe);
+            return Err(TaronError::InvalidBlock);
+        }
         let mut reverted = Vec::new();
         while self.height > target_height {
             let block = self.revert_tip(ledger)?;
