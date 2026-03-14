@@ -1229,7 +1229,34 @@ async fn handle_messages(
                                         warn!("[SYNC] Fork too deep (fork_point: {}, tip: {}) — skipping", fp, chain.height());
                                     }
                                 } else {
-                                    warn!("[SYNC] Block #{} rejected: no common ancestor found", block.index);
+                                    // No common ancestor in this batch — fork is deeper than IBD chunk.
+                                    // If peer chain is significantly longer, revert to genesis and resync
+                                    // so we can converge on the canonical chain.
+                                    if incoming_max > chain.height() + 10 {
+                                        warn!(
+                                            "[SYNC] No common ancestor — peer chain {} vs our height {}. Reverting to genesis for full resync.",
+                                            incoming_max, chain.height()
+                                        );
+                                        let mut ledger_state = ledger.write().await;
+                                        match chain.revert_to_height(0, &mut *ledger_state) {
+                                            Ok(reverted) => {
+                                                chain_height_atomic.store(0, Ordering::Release);
+                                                cached_difficulty.store(chain.difficulty as u64, Ordering::Release);
+                                                cached_account_count.store(ledger_state.account_count() as u64, Ordering::Release);
+                                                cached_total_supply.store(ledger_state.total_supply(), Ordering::Release);
+                                                *cached_best_hash.write().await = hex::encode(&chain.tip().hash);
+                                                info!("[SYNC] Reverted {} blocks to genesis — resyncing from block 1", reverted.len());
+                                                fork_handled = true;
+                                                last_height = 0;
+                                                applied = 1; // trigger IBD continuation from height 0
+                                            }
+                                            Err(e) => {
+                                                warn!("[SYNC] Revert to genesis failed: {}", e);
+                                            }
+                                        }
+                                    } else {
+                                        warn!("[SYNC] Block #{} rejected: no common ancestor found", block.index);
+                                    }
                                 }
                                 if fork_handled { break; } else { break; }
                             }
