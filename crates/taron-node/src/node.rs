@@ -1229,9 +1229,14 @@ async fn handle_messages(
                                         warn!("[SYNC] Fork too deep (fork_point: {}, tip: {}) — skipping", fp, chain.height());
                                     }
                                 } else {
-                                    // No common ancestor in this batch — fork is deeper than IBD chunk.
-                                    // Only revert to genesis during early IBD, not once established.
-                                    if incoming_max > chain.height() + 10 && chain.height() < 200 {
+                                    // No common ancestor in this batch.
+                                    // Revert to genesis only if:
+                                    //   - still in early IBD (height < 200), OR
+                                    //   - established but massively behind (peer > us + 1000):
+                                    //     we are on a minority fork and must resync from scratch.
+                                    // Never revert when close to the tip — just reject the batch.
+                                    if incoming_max > chain.height() + 10
+                                        && (chain.height() < 200 || incoming_max > chain.height() + 1000) {
                                         warn!(
                                             "[SYNC] No common ancestor — peer chain {} vs our height {}. Reverting to genesis for full resync.",
                                             incoming_max, chain.height()
