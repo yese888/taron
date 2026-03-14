@@ -640,7 +640,7 @@ async fn connect_to_peer(
     let _ = btx.send(Message::GetTxHashes);
 
     // Handle incoming messages (reads from read_half, sends responses via btx)
-    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, ibd_peer, chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
+    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, ibd_peer.clone(), chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
 
     // Release IBD slot if this peer was driving IBD
     {
