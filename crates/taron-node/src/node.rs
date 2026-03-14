@@ -87,6 +87,9 @@ pub struct TaronNode {
     /// Prevents 17 peers from all queuing for the write lock simultaneously,
     /// which starves RPC read operations.
     pub block_semaphore: Arc<Semaphore>,
+    /// The peer currently driving IBD. None when synced.
+    /// Only this peer can trigger reorgs or apply batched blocks.
+    pub ibd_peer: Arc<Mutex<Option<SocketAddr>>>,
     /// Current chain height — updated atomically after each block, used for
     /// lock-free quick-reject of stale block submissions.
     pub chain_height: Arc<AtomicU64>,
@@ -144,6 +147,7 @@ impl TaronNode {
             data_dir,
             sync_ready: Arc::new(AtomicBool::new(false)),
             block_semaphore: Arc::new(Semaphore::new(1)),
+            ibd_peer: Arc::new(Mutex::new(None)),
             chain_height: Arc::new(AtomicU64::new(initial_height)),
             cached_difficulty: Arc::new(AtomicU64::new(initial_diff)),
             cached_best_hash: Arc::new(RwLock::new(initial_hash)),
@@ -181,6 +185,7 @@ impl TaronNode {
             data_dir,
             sync_ready: Arc::new(AtomicBool::new(false)),
             block_semaphore: Arc::new(Semaphore::new(1)),
+            ibd_peer: Arc::new(Mutex::new(None)),
             chain_height: Arc::new(AtomicU64::new(initial_height)),
             cached_difficulty: Arc::new(AtomicU64::new(initial_diff)),
             cached_best_hash: Arc::new(RwLock::new(initial_hash)),
@@ -277,13 +282,14 @@ impl TaronNode {
             let discovered = self.discovered_peers.clone();
             let sync_ready = self.sync_ready.clone();
             let block_sem = self.block_semaphore.clone();
+            let ibd_peer = self.ibd_peer.clone();
             let chain_h = self.chain_height.clone();
             let cached_ac = self.cached_account_count.clone();
             let cached_ts = self.cached_total_supply.clone();
             let cached_diff = self.cached_difficulty.clone();
             let cached_bh = self.cached_best_hash.clone();
             tokio::spawn(async move {
-                if let Err(e) = connect_to_peer(seed, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered, sync_ready, block_sem, chain_h, cached_ac, cached_ts, cached_diff, cached_bh).await {
+                if let Err(e) = connect_to_peer(seed, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered, sync_ready, block_sem, ibd_peer, chain_h, cached_ac, cached_ts, cached_diff, cached_bh).await {
                     warn!("Failed to connect to seed {}: {}", seed, e);
                 }
             });
@@ -303,6 +309,7 @@ impl TaronNode {
             let discovered = self.discovered_peers.clone();
             let sync_ready = self.sync_ready.clone();
             let block_sem = self.block_semaphore.clone();
+            let ibd_peer_rc = self.ibd_peer.clone();
             let chain_h = self.chain_height.clone();
             let cached_ac = self.cached_account_count.clone();
             let cached_ts = self.cached_total_supply.clone();
@@ -353,13 +360,14 @@ impl TaronNode {
                         let discovered = discovered.clone();
                         let sync_ready = sync_ready.clone();
                         let block_sem = block_sem.clone();
+                        let ibd_peer_rc = ibd_peer_rc.clone();
                         let chain_h = chain_h.clone();
                         let cached_ac = cached_ac.clone();
                         let cached_ts = cached_ts.clone();
                         let cached_diff = cached_diff.clone();
                         let cached_bh = cached_bh.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = connect_to_peer(candidate, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered, sync_ready, block_sem, chain_h, cached_ac, cached_ts, cached_diff, cached_bh).await {
+                            if let Err(e) = connect_to_peer(candidate, port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered, sync_ready, block_sem, ibd_peer_rc, chain_h, cached_ac, cached_ts, cached_diff, cached_bh).await {
                                 debug!("[P2P] Connect to {} failed: {}", candidate, e);
                             }
                         });
@@ -450,6 +458,7 @@ impl TaronNode {
             let discovered = self.discovered_peers.clone();
             let sync_ready = self.sync_ready.clone();
             let block_sem = self.block_semaphore.clone();
+            let ibd_peer_in = self.ibd_peer.clone();
             let chain_h = self.chain_height.clone();
             let cached_ac = self.cached_account_count.clone();
             let cached_ts = self.cached_total_supply.clone();
@@ -457,7 +466,7 @@ impl TaronNode {
             let cached_bh = self.cached_best_hash.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_peer(stream, addr, port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered, sync_ready, block_sem, chain_h, cached_ac, cached_ts, cached_diff, cached_bh).await {
+                if let Err(e) = handle_peer(stream, addr, port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered, sync_ready, block_sem, ibd_peer_in, chain_h, cached_ac, cached_ts, cached_diff, cached_bh).await {
                     debug!("Peer {} disconnected: {}", addr, e);
                 }
                 peers.lock().await.remove_peer(&addr);
@@ -569,6 +578,7 @@ async fn connect_to_peer(
     discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
     sync_ready: Arc<AtomicBool>,
     block_semaphore: Arc<Semaphore>,
+    ibd_peer: Arc<Mutex<Option<SocketAddr>>>,
     chain_height: Arc<AtomicU64>,
     cached_account_count: Arc<AtomicU64>,
     cached_total_supply: Arc<AtomicU64>,
@@ -630,7 +640,7 @@ async fn connect_to_peer(
     let _ = btx.send(Message::GetTxHashes);
 
     // Handle incoming messages (reads from read_half, sends responses via btx)
-    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
+    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, ibd_peer, chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
 
     // Gracefully shut down the writer task: drop ALL senders so brx.recv() returns None,
     // then abort if stuck — prevents CLOSE-WAIT FD leak.
@@ -655,6 +665,7 @@ async fn handle_peer(
     discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
     sync_ready: Arc<AtomicBool>,
     block_semaphore: Arc<Semaphore>,
+    ibd_peer: Arc<Mutex<Option<SocketAddr>>>,
     chain_height: Arc<AtomicU64>,
     cached_account_count: Arc<AtomicU64>,
     cached_total_supply: Arc<AtomicU64>,
@@ -694,7 +705,7 @@ async fn handle_peer(
     let _ = btx.send(Message::GetChainHeight);
 
     let peers_cleanup = peers.clone();
-    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
+    let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, ibd_peer, chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
 
     // Gracefully shut down the writer task, then abort if stuck — prevents FD leak.
     {
@@ -729,6 +740,7 @@ async fn handle_messages(
     discovered_peers: Arc<RwLock<HashSet<SocketAddr>>>,
     sync_ready: Arc<AtomicBool>,
     block_semaphore: Arc<Semaphore>,
+    ibd_peer: Arc<Mutex<Option<SocketAddr>>>,
     chain_height_atomic: Arc<AtomicU64>,
     cached_account_count: Arc<AtomicU64>,
     cached_total_supply: Arc<AtomicU64>,
@@ -1116,6 +1128,20 @@ async fn handle_messages(
                 peer_height = Some(peer_h);
                 let our_h = blockchain.read().await.height();
                 if peer_h > our_h {
+                    // Try to claim the IBD slot — only one peer drives IBD at a time.
+                    let claimed = {
+                        let mut slot = ibd_peer.lock().await;
+                        if slot.is_none() {
+                            *slot = Some(addr);
+                            true
+                        } else {
+                            *slot == Some(addr)
+                        }
+                    };
+                    if !claimed {
+                        debug!("[SYNC] Peer {} wants IBD but another peer is syncing — skipping", addr);
+                        continue;
+                    }
                     info!(
                         "[SYNC] Peer {} reports height {} — we are at {} — launching IBD",
                         addr, peer_h, our_h
@@ -1140,10 +1166,22 @@ async fn handle_messages(
             }
 
             Message::Blocks(blocks) => {
+                // Only the designated IBD peer can apply batched blocks.
+                // If another peer is driving IBD, ignore this batch entirely.
+                {
+                    let slot = ibd_peer.lock().await;
+                    if let Some(ibd_addr) = *slot {
+                        if ibd_addr != addr {
+                            debug!("[SYNC] Ignoring Blocks from {} — IBD peer is {}", addr, ibd_addr);
+                            continue;
+                        }
+                    }
+                }
                 // Batch block sync — apply each in order, with deep reorg support
                 if blocks.is_empty() {
                     let h = blockchain.read().await.height();
                     info!("[SYNC] Sync complete — height: {}", h);
+                    *ibd_peer.lock().await = None;
                     if !sync_ready.load(Ordering::Relaxed) {
                         sync_ready.store(true, Ordering::Release);
                         info!("[SYNC] Sync ready — mining can start");
@@ -1299,6 +1337,8 @@ async fn handle_messages(
                                 send_to_peer(out_tx, Message::GetBlocks { from, to })?;
                             } else {
                                 info!("[SYNC] IBD complete — height: {}", our_h);
+                                // Release IBD slot so other peers can trigger future syncs
+                                *ibd_peer.lock().await = None;
                                 if !sync_ready.load(Ordering::Relaxed) {
                                     sync_ready.store(true, Ordering::Release);
                                     info!("[SYNC] Sync ready — mining can start");
