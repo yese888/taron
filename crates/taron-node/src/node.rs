@@ -926,6 +926,15 @@ async fn handle_messages(
             // ── Block propagation ────────────────────────────────────────────
 
             Message::NewBlock(block) => {
+                // During IBD, ignore NewBlock from non-IBD peers
+                {
+                    let slot = ibd_peer.lock().await;
+                    if let Some(ibd_addr) = *slot {
+                        if ibd_addr != addr {
+                            continue;
+                        }
+                    }
+                }
                 let block_index = block.index;
                 let block_hash_hex = hex::encode(&block.hash[..8]);
 

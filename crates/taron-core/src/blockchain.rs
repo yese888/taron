@@ -276,7 +276,8 @@ impl Blockchain {
         }
 
         let prev = self.tip();
-        if !block.is_valid_ibd(&prev, self.difficulty) {
+        if let Some(reason) = block.validate_inner(&prev, self.difficulty, false) {
+            eprintln!("[REJECT-IBD] block #{}: {}", block.index, reason);
             return Err(TaronError::InvalidBlock);
         }
 
