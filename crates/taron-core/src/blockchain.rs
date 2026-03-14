@@ -23,6 +23,15 @@ const DAA_WINDOW: u64 = 10;
 /// DAA: target time per block in milliseconds (30 seconds).
 const TARGET_BLOCK_MS: u64 = 30_000;
 
+/// Known-good block hashes. Any block at these heights must match exactly.
+/// A peer sending a different hash at a checkpoint height is on a fork — reject immediately.
+const CHECKPOINTS: &[(u64, &str)] = &[
+    (1000, "000002972377958419f026f52436738aaa63be77143e711da89d1fb8f0742acb"),
+    (3000, "0000016ef4c1110ffc985192a6a0769d540a5b71bb5885b0ff250a021bfbeb46"),
+    (5000, "000006737ab2a41d65938e6c2b5b9556eec9bea25907ae4e14903950b00f1309"),
+    (7000, "00001cc75eddfc930b3c4994715803bd93460b7ac9f5d70abe8bbdfe86dbb637"),
+];
+
 // ── RocksDB key layout ────────────────────────────────────────────────────────
 // b"b:" + index_le_u64  →  bincode-encoded Block
 // b"meta:h"             →  height as le u64
@@ -230,6 +239,14 @@ impl Blockchain {
     /// Like `apply_block` but skips the timestamp drift check and sequence check.
     /// Used during IBD (Initial Block Download) for historical blocks.
     pub fn apply_block_ibd(&mut self, block: &Block, ledger: &mut Ledger) -> Result<(), TaronError> {
+        // Checkpoint: if this block height has a known-good hash, reject any mismatch.
+        if let Some(&(_, expected)) = CHECKPOINTS.iter().find(|&&(h, _)| h == block.index) {
+            if hex::encode(&block.hash) != expected {
+                eprintln!("[REJECT] block #{}: checkpoint mismatch", block.index);
+                return Err(TaronError::InvalidBlock);
+            }
+        }
+
         let prev = self.tip();
         if !block.is_valid_ibd(&prev, self.difficulty) {
             return Err(TaronError::InvalidBlock);
