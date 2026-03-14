@@ -202,6 +202,12 @@ impl Blockchain {
     /// Validate and append a new block, then credit the miner in the ledger.
     /// The block is written to RocksDB atomically before returning.
     pub fn apply_block(&mut self, block: &Block, ledger: &mut Ledger) -> Result<(), TaronError> {
+        if let Some(&(_, expected)) = CHECKPOINTS.iter().find(|&&(h, _)| h == block.index) {
+            if hex::encode(&block.hash) != expected {
+                eprintln!("[REJECT] block #{}: checkpoint mismatch", block.index);
+                return Err(TaronError::InvalidBlock);
+            }
+        }
         let prev = self.tip();
         if let Some(reason) = block.validate_inner(&prev, self.difficulty, true) {
             eprintln!("[REJECT] block #{}: {}", block.index, reason);
