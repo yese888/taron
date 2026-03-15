@@ -1350,6 +1350,41 @@ async fn handle_messages(
                                 }
                                 let fork_point = chain.find_fork_point(&blocks);
                                 if let Some(fp) = fork_point {
+                                    // Self-heal for difficulty-drift stalls:
+                                    // If fork point is exactly our tip (depth 0), incoming chain is
+                                    // much longer, and we made no progress in this batch, rolling back
+                                    // to a recent checkpoint allows re-deriving difficulty on canonical history.
+                                    if fp == chain.height() && applied == 0 && incoming_max > chain.height() + 50 {
+                                        let anchor = chain.checkpoint_anchor_at_or_below(chain.height().saturating_sub(1));
+                                        if anchor < chain.height() {
+                                            warn!(
+                                                "[SYNC] Zero-depth fork stall at {} (peer tip {}) — rolling back to checkpoint {} for recovery",
+                                                chain.height(), incoming_max, anchor
+                                            );
+                                            let mut ledger_state = ledger.write().await;
+                                            match chain.revert_to_height(anchor, &mut *ledger_state) {
+                                                Ok(reverted) => {
+                                                    chain_height_atomic.store(anchor, Ordering::Release);
+                                                    cached_difficulty.store(chain.difficulty as u64, Ordering::Release);
+                                                    cached_account_count.store(ledger_state.account_count() as u64, Ordering::Release);
+                                                    cached_total_supply.store(ledger_state.total_supply(), Ordering::Release);
+                                                    *cached_best_hash.write().await = hex::encode(&chain.tip().hash);
+                                                    info!(
+                                                        "[SYNC] Recovery rollback complete: reverted {} blocks to checkpoint {}",
+                                                        reverted.len(), anchor
+                                                    );
+                                                    fork_handled = true;
+                                                    last_height = anchor;
+                                                    applied = 1; // trigger IBD continuation from anchor
+                                                }
+                                                Err(e) => {
+                                                    warn!("[SYNC] Recovery rollback failed: {}", e);
+                                                }
+                                            }
+                                            break;
+                                        }
+                                    }
+
                                     // Allow deeper reorg when incoming chain is much longer (IBD case)
                                     let reorg_depth = chain.height() - fp;
                                     let max_reorg = if incoming_max > chain.height() + 5 {
