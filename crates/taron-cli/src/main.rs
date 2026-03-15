@@ -615,20 +615,11 @@ async fn main() -> anyhow::Result<()> {
 
                         std::thread::spawn(move || {
                             // Wait for initial sync to complete before mining.
-                            // This prevents mining on a stale tip (e.g. genesis) while IBD
-                            // hasn't started yet, which would cause an immediate fork.
-                            // Timeout after 30s for solo miners with no peers.
+                            // This prevents mining on a stale or incomplete tip while IBD
+                            // is still discovering and downloading the canonical chain.
                             {
                                 use std::sync::atomic::Ordering;
-                                let wait_start = std::time::Instant::now();
-                                let timeout = std::time::Duration::from_secs(30);
                                 while !sync_ready.load(Ordering::Acquire) {
-                                    if wait_start.elapsed() >= timeout {
-                                        if thread_id == 0 {
-                                            eprintln!(" [MINER] No peers found after 30s — starting mining (solo mode)");
-                                        }
-                                        break;
-                                    }
                                     std::thread::sleep(std::time::Duration::from_millis(100));
                                 }
                                 if thread_id == 0 && sync_ready.load(Ordering::Acquire) {
