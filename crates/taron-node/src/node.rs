@@ -1373,7 +1373,6 @@ async fn handle_messages(
                                                         "[SYNC] Recovery rollback complete: reverted {} blocks to checkpoint {}",
                                                         reverted.len(), anchor
                                                     );
-                                                    fork_handled = true;
                                                     last_height = anchor;
                                                     applied = 1; // trigger IBD continuation from anchor
                                                 }
