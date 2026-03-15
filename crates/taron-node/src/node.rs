@@ -643,16 +643,26 @@ async fn connect_to_peer(
     let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers.clone(), known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, ibd_peer.clone(), chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
 
     // Release IBD slot if this peer was driving IBD
+    let mut released_ibd_driver = false;
     {
         let mut slot = ibd_peer.lock().await;
         if *slot == Some(addr) {
             *slot = None;
+            released_ibd_driver = true;
         }
     }
     // Gracefully shut down the writer task: drop ALL senders so brx.recv() returns None,
     // then abort if stuck — prevents CLOSE-WAIT FD leak.
     peers.lock().await.remove_peer(&addr); // drops the cloned sender in PeerManager
     drop(btx); // drops the local sender — now all senders are gone
+
+    // If the IBD driver disconnected, immediately query all remaining peers
+    // for height so another peer can take over without waiting.
+    if released_ibd_driver {
+        let pm = peers.lock().await;
+        pm.broadcast(Message::GetChainHeight, None);
+    }
+
     shutdown_writer(writer_handle, addr).await;
     result
 }
@@ -715,10 +725,12 @@ async fn handle_peer(
     let result = handle_messages(&mut read_half, &btx, addr, our_port, mempool, peers, known, ledger, blockchain, finality, data_dir, discovered_peers, sync_ready, block_semaphore, ibd_peer.clone(), chain_height, cached_account_count, cached_total_supply, cached_difficulty, cached_best_hash).await;
 
     // Release IBD slot if this peer was driving IBD
+    let mut released_ibd_driver = false;
     {
         let mut slot = ibd_peer.lock().await;
         if *slot == Some(addr) {
             *slot = None;
+            released_ibd_driver = true;
         }
     }
     // Gracefully shut down the writer task, then abort if stuck — prevents FD leak.
@@ -729,6 +741,14 @@ async fn handle_peer(
         }
     }
     drop(btx); // drop the local sender — all senders gone, writer exits
+
+    // If the IBD driver disconnected, immediately ask remaining peers for height
+    // to re-elect an IBD source quickly.
+    if released_ibd_driver {
+        let pm = peers_cleanup.lock().await;
+        pm.broadcast(Message::GetChainHeight, None);
+    }
+
     shutdown_writer(writer_handle, addr).await;
     result
 }

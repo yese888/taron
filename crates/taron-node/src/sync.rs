@@ -26,7 +26,8 @@ use taron_core::Block;
 use crate::protocol::{self, Message};
 
 /// Number of blocks requested in each IBD chunk.
-pub const IBD_CHUNK_SIZE: u64 = 100;
+/// Keep this modest to avoid oversized `Blocks` payloads on busy ranges.
+pub const IBD_CHUNK_SIZE: u64 = 25;
 
 /// Shared chain state — height + best block hash.
 #[derive(Debug)]
