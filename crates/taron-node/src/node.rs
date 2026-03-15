@@ -761,8 +761,14 @@ async fn handle_messages(
     cached_difficulty: Arc<AtomicU64>,
     cached_best_hash: Arc<RwLock<String>>,
 ) -> io::Result<()> {
+    const IBD_RESEND_INTERVAL_SECS: u64 = 12;
+    const IBD_STALL_SWITCH_SECS: u64 = 45;
+
     // Track the peer's reported chain height so IBD can continue chunk by chunk.
     let mut peer_height: Option<u64> = None;
+    let mut last_ibd_progress_height = chain_height_atomic.load(Ordering::Relaxed);
+    let mut last_ibd_progress_at = Instant::now();
+    let mut last_ibd_request_at: Option<Instant> = None;
     let mut last_recv = Instant::now();
     let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(45));
     ping_interval.tick().await; // first tick is immediate, skip it
@@ -786,6 +792,48 @@ async fn handle_messages(
                     debug!("[P2P] Peer {} idle for 120s — disconnecting", addr);
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "peer idle timeout"));
                 }
+
+                // IBD watchdog: if this peer currently drives IBD and progress stalls,
+                // proactively re-request missing chunks; if still stuck, release IBD slot
+                // and disconnect this peer so another peer can take over.
+                let is_ibd_driver = {
+                    let slot = ibd_peer.lock().await;
+                    *slot == Some(addr)
+                };
+                if is_ibd_driver {
+                    if let Some(ph) = peer_height {
+                        let our_h = chain_height_atomic.load(Ordering::Relaxed);
+
+                        if our_h > last_ibd_progress_height {
+                            last_ibd_progress_height = our_h;
+                            last_ibd_progress_at = Instant::now();
+                        }
+
+                        if our_h < ph {
+                            let need_resend = last_ibd_request_at
+                                .map(|t| t.elapsed() >= std::time::Duration::from_secs(IBD_RESEND_INTERVAL_SECS))
+                                .unwrap_or(true);
+                            if need_resend {
+                                let from = our_h + 1;
+                                let to = (from + crate::sync::IBD_CHUNK_SIZE - 1).min(ph);
+                                info!("[SYNC] IBD watchdog: re-requesting blocks {}..{} from {}", from, to, addr);
+                                send_to_peer(out_tx, Message::GetBlocks { from, to })?;
+                                last_ibd_request_at = Some(Instant::now());
+                            }
+
+                            if last_ibd_progress_at.elapsed() >= std::time::Duration::from_secs(IBD_STALL_SWITCH_SECS) {
+                                warn!(
+                                    "[SYNC] IBD stalled for {}s with {} at height {}<{} — switching peer",
+                                    IBD_STALL_SWITCH_SECS, addr, our_h, ph
+                                );
+                                *ibd_peer.lock().await = None;
+                                sync_ready.store(false, Ordering::Release);
+                                return Err(io::Error::new(io::ErrorKind::TimedOut, "ibd stalled, switching peer"));
+                            }
+                        }
+                    }
+                }
+
                 // Send keepalive ping
                 let nonce = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
@@ -944,6 +992,7 @@ async fn handle_messages(
                 // Block is ahead of our tip — request sync, don't process yet
                 if block_index > our_height + 1 {
                     peer_height = Some(block_index);
+                    sync_ready.store(false, Ordering::Release);
                     info!(
                         "[SYNC] NewBlock #{} from {} is ahead of our height {} — requesting blocks {}..{}",
                         block_index, addr, our_height, our_height + 1, block_index
@@ -951,6 +1000,7 @@ async fn handle_messages(
                     let from = our_height + 1;
                     let to = (from + crate::sync::IBD_CHUNK_SIZE - 1).min(block_index);
                     send_to_peer(out_tx, Message::GetBlocks { from, to })?;
+                    last_ibd_request_at = Some(Instant::now());
                     continue;
                 }
 
@@ -1042,6 +1092,7 @@ async fn handle_messages(
                         if block_index > our_h + 1 {
                             // We're behind — request all missing blocks from this peer
                             peer_height = Some(block_index);
+                            sync_ready.store(false, Ordering::Release);
                             info!(
                                 "[SYNC] NewBlock #{} from {} is ahead of our height {} — requesting blocks {}..{}",
                                 block_index, addr, our_h, our_h + 1, block_index
@@ -1049,6 +1100,7 @@ async fn handle_messages(
                             let from = our_h + 1;
                             let to = (from + crate::sync::IBD_CHUNK_SIZE - 1).min(block_index);
                             send_to_peer(out_tx, Message::GetBlocks { from, to })?;
+                            last_ibd_request_at = Some(Instant::now());
                         } else if block_index == our_h + 1 {
                             // Next block but doesn't link to our tip — peer is on a fork
                             // Request their recent blocks so the Blocks handler can deep-reorg
@@ -1169,10 +1221,12 @@ async fn handle_messages(
                         "[SYNC] Peer {} reports height {} — we are at {} — launching IBD",
                         addr, peer_h, our_h
                     );
+                    sync_ready.store(false, Ordering::Release);
                     let from = our_h + 1;
                     let to = (from + crate::sync::IBD_CHUNK_SIZE - 1).min(peer_h);
                     info!("[SYNC] Downloading blocks {}..{} from {}", from, to, addr);
                     send_to_peer(out_tx, Message::GetBlocks { from, to })?;
+                    last_ibd_request_at = Some(Instant::now());
                 } else {
                     info!("[SYNC] Peer {} height {} — already in sync (height {})", addr, peer_h, our_h);
                     let ibd_active = ibd_peer.lock().await.is_some();
@@ -1206,6 +1260,7 @@ async fn handle_messages(
                     let h = blockchain.read().await.height();
                     info!("[SYNC] Sync complete — height: {}", h);
                     *ibd_peer.lock().await = None;
+                    last_ibd_request_at = None;
                     if !sync_ready.load(Ordering::Relaxed) {
                         sync_ready.store(true, Ordering::Release);
                         info!("[SYNC] Sync ready — mining can start");
@@ -1232,6 +1287,8 @@ async fn handle_messages(
                                 applied += 1;
                                 last_height = block.index;
                                 chain_height_atomic.store(block.index, Ordering::Release);
+                                last_ibd_progress_height = block.index;
+                                last_ibd_progress_at = Instant::now();
                                 *cached_best_hash.write().await = hex::encode(&block.hash);
                                 let hash_prefix = hex::encode(&block.hash[..5]);
                                 info!("[SYNC] Applied block #{} | hash: {}…", block.index, hash_prefix);
@@ -1270,6 +1327,8 @@ async fn handle_messages(
                                                             applied += 1;
                                                             last_height = new_block.index;
                                                             chain_height_atomic.store(new_block.index, Ordering::Release);
+                                                            last_ibd_progress_height = new_block.index;
+                                                            last_ibd_progress_at = Instant::now();
                                                             cached_difficulty.store(chain.difficulty as u64, Ordering::Release);
                                                             cached_account_count.store(ledger_state.account_count() as u64, Ordering::Release);
                                                             cached_total_supply.store(ledger_state.total_supply(), Ordering::Release);
@@ -1364,10 +1423,12 @@ async fn handle_messages(
                                 let to = (from + crate::sync::IBD_CHUNK_SIZE - 1).min(ph);
                                 info!("[SYNC] Continuing IBD: downloading blocks {}..{} from {}", from, to, addr);
                                 send_to_peer(out_tx, Message::GetBlocks { from, to })?;
+                                last_ibd_request_at = Some(Instant::now());
                             } else {
                                 info!("[SYNC] IBD complete — height: {}", our_h);
                                 // Release IBD slot so other peers can trigger future syncs
                                 *ibd_peer.lock().await = None;
+                                last_ibd_request_at = None;
                                 if !sync_ready.load(Ordering::Relaxed) {
                                     sync_ready.store(true, Ordering::Release);
                                     info!("[SYNC] Sync ready — mining can start");
