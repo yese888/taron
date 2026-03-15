@@ -411,8 +411,23 @@ impl Blockchain {
                 let d_arr: [u8; 4] = (&d_bytes[..]).try_into().unwrap_or([0u8; 4]);
                 u32::from_le_bytes(d_arr)
             } else { difficulty };
-            eprintln!("[CHAIN] Loaded from RocksDB — height: {}, diff: {} bits", height, diff);
-            return Self { db, height, difficulty: diff };
+            let mut chain = Self { db, height, difficulty: diff };
+
+            // Repair stale persisted difficulty by recomputing from chain history.
+            // This prevents IBD false rejections like "insufficient difficulty"
+            // after crashes/reorgs where KEY_DIFF may drift from canonical value.
+            let canonical_diff = chain.recompute_difficulty_from_chain();
+            if canonical_diff != chain.difficulty {
+                eprintln!(
+                    "[CHAIN] Difficulty corrected from {} -> {} at height {}",
+                    chain.difficulty, canonical_diff, chain.height
+                );
+                chain.difficulty = canonical_diff;
+                let _ = chain.db.put(KEY_DIFF, &chain.difficulty.to_le_bytes());
+            }
+
+            eprintln!("[CHAIN] Loaded from RocksDB — height: {}, diff: {} bits", chain.height, chain.difficulty);
+            return chain;
         }
 
         // ── Case 2: migrate from legacy chain.json ───────────────────────────
@@ -435,8 +450,20 @@ impl Blockchain {
                     }
                     db.put(KEY_HEIGHT, &height.to_le_bytes()).expect("rocksdb put height");
                     db.put(KEY_DIFF, &legacy.difficulty.to_le_bytes()).expect("rocksdb put diff");
-                    eprintln!("[CHAIN] Migration complete — height: {}", height);
-                    return Self { db, height, difficulty: legacy.difficulty };
+
+                    let mut chain = Self { db, height, difficulty: legacy.difficulty };
+                    let canonical_diff = chain.recompute_difficulty_from_chain();
+                    if canonical_diff != chain.difficulty {
+                        eprintln!(
+                            "[CHAIN] Difficulty corrected after migration: {} -> {}",
+                            chain.difficulty, canonical_diff
+                        );
+                        chain.difficulty = canonical_diff;
+                        let _ = chain.db.put(KEY_DIFF, &chain.difficulty.to_le_bytes());
+                    }
+
+                    eprintln!("[CHAIN] Migration complete — height: {}", chain.height);
+                    return chain;
                 }
             }
         }
@@ -480,6 +507,48 @@ impl Blockchain {
         };
 
         new_diff.max(1).min(30)
+    }
+
+    fn adjust_difficulty_step(current_diff: u32, actual_ms: u64, target_ms: u64) -> u32 {
+        if actual_ms == 0 {
+            return (current_diff + 1).min(30);
+        }
+
+        let new_diff = if actual_ms < target_ms / 4 {
+            current_diff.saturating_add(2)
+        } else if actual_ms < target_ms {
+            current_diff.saturating_add(1)
+        } else if actual_ms > target_ms * 4 {
+            current_diff.saturating_sub(2)
+        } else if actual_ms > target_ms {
+            current_diff.saturating_sub(1)
+        } else {
+            current_diff
+        };
+
+        new_diff.max(1).min(30)
+    }
+
+    /// Recompute canonical difficulty from genesis up to current `height`.
+    /// Uses only block timestamps at DAA boundaries and ignores persisted KEY_DIFF.
+    fn recompute_difficulty_from_chain(&self) -> u32 {
+        if self.height < DAA_WINDOW {
+            return crate::TESTNET_DIFFICULTY;
+        }
+
+        let mut diff = crate::TESTNET_DIFFICULTY;
+        let target_ms = TARGET_BLOCK_MS * DAA_WINDOW;
+
+        let mut boundary = DAA_WINDOW;
+        while boundary <= self.height {
+            let Some(window_end) = self.block_at(boundary) else { break; };
+            let Some(window_start) = self.block_at(boundary - DAA_WINDOW) else { break; };
+            let actual_ms = window_end.timestamp.saturating_sub(window_start.timestamp);
+            diff = Self::adjust_difficulty_step(diff, actual_ms, target_ms);
+            boundary += DAA_WINDOW;
+        }
+
+        diff
     }
 }
 
