@@ -1175,7 +1175,8 @@ async fn handle_messages(
                     send_to_peer(out_tx, Message::GetBlocks { from, to })?;
                 } else {
                     info!("[SYNC] Peer {} height {} — already in sync (height {})", addr, peer_h, our_h);
-                    if !sync_ready.load(Ordering::Relaxed) {
+                    let ibd_active = ibd_peer.lock().await.is_some();
+                    if !ibd_active && !sync_ready.load(Ordering::Relaxed) {
                         sync_ready.store(true, Ordering::Release);
                         info!("[SYNC] Sync ready — mining can start");
                     }
@@ -1291,35 +1292,40 @@ async fn handle_messages(
                                     }
                                 } else {
                                     // No common ancestor in this batch.
-                                    // Revert to genesis only if:
-                                    //   - still in early IBD (height < 200), OR
-                                    //   - established but massively behind (peer > us + 1000):
-                                    //     we are on a minority fork and must resync from scratch.
-                                    // Never revert when close to the tip — just reject the batch.
+                                    // No common ancestor found in current batch. To avoid getting
+                                    // stuck forever at one height, roll back to a safe checkpoint
+                                    // anchor (not genesis) when peer chain is significantly ahead.
                                     let peer_announced = peer_height.unwrap_or(incoming_max);
                                     if incoming_max > chain.height() + 10
-                                        && (chain.height() < 100 || peer_announced > chain.height() + 2000) {
+                                        && (chain.height() < 200 || peer_announced > chain.height() + 300) {
+                                        let anchor = if chain.height() < 200 {
+                                            0
+                                        } else {
+                                            chain.checkpoint_anchor_at_or_below(chain.height().saturating_sub(1))
+                                        };
                                         warn!(
-                                            "[SYNC] No common ancestor — peer chain {} vs our height {}. Reverting to genesis for full resync.",
-                                            incoming_max, chain.height()
+                                            "[SYNC] No common ancestor — peer chain {} vs our height {}. Reverting to checkpoint anchor {}.",
+                                            incoming_max, chain.height(), anchor
                                         );
                                         let mut ledger_state = ledger.write().await;
-                                        match chain.revert_to_height(0, &mut *ledger_state) {
+                                        match chain.revert_to_height(anchor, &mut *ledger_state) {
                                             Ok(reverted) => {
-                                                // Reset difficulty to initial after full revert to genesis
-                                                chain.difficulty = TESTNET_DIFFICULTY;
-                                                chain_height_atomic.store(0, Ordering::Release);
+                                                // If we reverted to genesis, ensure difficulty reset.
+                                                if anchor == 0 {
+                                                    chain.difficulty = TESTNET_DIFFICULTY;
+                                                }
+                                                chain_height_atomic.store(anchor, Ordering::Release);
                                                 cached_difficulty.store(chain.difficulty as u64, Ordering::Release);
                                                 cached_account_count.store(ledger_state.account_count() as u64, Ordering::Release);
                                                 cached_total_supply.store(ledger_state.total_supply(), Ordering::Release);
                                                 *cached_best_hash.write().await = hex::encode(&chain.tip().hash);
-                                                info!("[SYNC] Reverted {} blocks to genesis — resyncing from block 1", reverted.len());
+                                                info!("[SYNC] Reverted {} blocks to {} — resyncing from block {}", reverted.len(), anchor, anchor + 1);
                                                 fork_handled = true;
-                                                last_height = 0;
-                                                applied = 1; // trigger IBD continuation from height 0
+                                                last_height = anchor;
+                                                applied = 1; // trigger IBD continuation from anchor
                                             }
                                             Err(e) => {
-                                                warn!("[SYNC] Revert to genesis failed: {}", e);
+                                                warn!("[SYNC] Revert to checkpoint anchor failed: {}", e);
                                             }
                                         }
                                     } else {

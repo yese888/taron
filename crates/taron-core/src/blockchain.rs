@@ -140,6 +140,17 @@ impl Blockchain {
             .collect()
     }
 
+    /// Highest checkpoint height at or below `height`.
+    /// Returns 0 when no checkpoint is below the requested height.
+    pub fn checkpoint_anchor_at_or_below(&self, height: u64) -> u64 {
+        CHECKPOINTS
+            .iter()
+            .filter(|&&(h, _)| h <= height)
+            .map(|&(h, _)| h)
+            .max()
+            .unwrap_or(0)
+    }
+
     // ── Mutation ─────────────────────────────────────────────────────────────
 
     /// Revert the tip block: remove it from RocksDB, decrement height,
