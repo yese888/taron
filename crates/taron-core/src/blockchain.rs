@@ -56,6 +56,15 @@ fn block_key(index: u64) -> [u8; 10] {
     key[2..].copy_from_slice(&index.to_le_bytes());
     key
 }
+
+/// Snapshot key for difficulty before a DAA boundary is applied.
+/// Layout: b"meta:pd:" + boundary_height_le_u64 -> previous difficulty (le u32)
+fn prev_diff_key(boundary_height: u64) -> Vec<u8> {
+    let mut key = b"meta:pd:".to_vec();
+    key.extend_from_slice(&boundary_height.to_le_bytes());
+    key
+}
+
 const KEY_HEIGHT: &[u8] = b"meta:h";
 const KEY_DIFF:   &[u8] = b"meta:d";
 
@@ -156,9 +165,18 @@ impl Blockchain {
         self.height -= 1;
         self.db.put(KEY_HEIGHT, &self.height.to_le_bytes()).expect("rocksdb put height");
 
-        // Restore difficulty from the previous tip if we're at a DAA boundary
+        // Restore difficulty when reverting a DAA boundary block.
+        // If we reverted boundary H, height is now H-1 and we must restore
+        // the difficulty that was active before applying H.
         if (self.height + 1) % DAA_WINDOW == 0 {
-            self.difficulty = self.compute_next_difficulty();
+            let boundary = self.height + 1;
+            if let Ok(Some(bytes)) = self.db.get(prev_diff_key(boundary)) {
+                let arr: [u8; 4] = (&bytes[..]).try_into().unwrap_or([0u8; 4]);
+                self.difficulty = u32::from_le_bytes(arr);
+            } else {
+                // Backward compatibility for old DBs without snapshots.
+                self.difficulty = self.compute_next_difficulty();
+            }
             self.db.put(KEY_DIFF, &self.difficulty.to_le_bytes()).expect("rocksdb put diff");
         }
 
@@ -197,6 +215,11 @@ impl Blockchain {
     /// Find the fork point between our chain and a set of incoming blocks.
     /// Returns the height of the last common ancestor, or None if no common block found.
     pub fn find_fork_point(&self, incoming: &[Block]) -> Option<u64> {
+        if incoming.is_empty() {
+            return None;
+        }
+
+        // Fast path: direct parent linkage check for any block in the batch.
         for block in incoming {
             if block.index == 0 { return Some(0); }
             let parent_height = block.index - 1;
@@ -206,6 +229,30 @@ impl Blockchain {
                 }
             }
         }
+
+        // Slow path: walk backward through the incoming mini-chain itself,
+        // so we can discover ancestors that are just before the current batch.
+        let mut probe_height = incoming[0].index.saturating_sub(1);
+        let mut probe_hash = incoming[0].prev_hash;
+
+        for _ in 0..incoming.len() {
+            if let Some(our_block) = self.block_at(probe_height) {
+                if our_block.hash == probe_hash {
+                    return Some(probe_height);
+                }
+            }
+            if probe_height == 0 {
+                break;
+            }
+
+            if let Some(prev_block) = incoming.iter().find(|b| b.index == probe_height) {
+                probe_hash = prev_block.prev_hash;
+                probe_height = probe_height.saturating_sub(1);
+            } else {
+                break;
+            }
+        }
+
         None
     }
 
@@ -257,7 +304,9 @@ impl Blockchain {
 
         // DAA: recalculate difficulty at every window boundary
         if self.height > 0 && self.height % DAA_WINDOW == 0 {
+            let old_diff = self.difficulty;
             self.difficulty = self.compute_next_difficulty();
+            self.db.put(prev_diff_key(self.height), &old_diff.to_le_bytes()).expect("rocksdb put prev diff");
             self.db.put(KEY_DIFF, &self.difficulty.to_le_bytes()).expect("rocksdb put diff");
         }
 
@@ -311,7 +360,9 @@ impl Blockchain {
         self.db.put(KEY_HEIGHT, &self.height.to_le_bytes()).expect("rocksdb put height");
 
         if self.height > 0 && self.height % DAA_WINDOW == 0 {
+            let old_diff = self.difficulty;
             self.difficulty = self.compute_next_difficulty();
+            self.db.put(prev_diff_key(self.height), &old_diff.to_le_bytes()).expect("rocksdb put prev diff");
             self.db.put(KEY_DIFF, &self.difficulty.to_le_bytes()).expect("rocksdb put diff");
         }
 
